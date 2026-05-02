@@ -20,6 +20,8 @@ export default function GameRoom() {
   const [submissions, setSubmissions] = useState<Submission[]>([]);
   const [selectedCards, setSelectedCards] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  // Guard against the auto-advance effect firing during round transitions
+  const [transitioning, setTransitioning] = useState(false);
 
   const myPlayer = players.find((p) => p.user_id === user?.id);
   const isVotingMode = players.length <= VOTING_MODE_MAX_PLAYERS;
@@ -69,13 +71,16 @@ export default function GameRoom() {
     return () => { supabase.removeChannel(channel); };
   }, [gameId, fetchAll]);
 
+  // Auto-advance to judging when all players have submitted
   useEffect(() => {
+    if (transitioning) return;
     if (!currentRound || currentRound.status !== 'submitting') return;
     const submitters = isVotingMode ? players : players.filter((p) => !p.is_czar);
     if (submitters.length === 0) return;
     if (submitters.every((p) => p.has_submitted)) advanceToJudging();
-  }, [players, currentRound, isVotingMode]);
+  }, [players, currentRound, isVotingMode, transitioning]);
 
+  // Auto-resolve voting when all players have voted
   useEffect(() => {
     if (!currentRound || currentRound.status !== 'judging' || !isVotingMode) return;
     if (submissions.length === 0) return;
@@ -103,21 +108,74 @@ export default function GameRoom() {
       czar_index: 0,
     }).eq('id', gameId);
 
-    await startNewRound(useVotingMode ? null : rotation[0], 1, readyPlayers);
+    await beginRound({
+      czarUserId: useVotingMode ? null : rotation[0],
+      roundNumber: 1,
+      activePlayers: readyPlayers,
+      deck: null, // will fetch fresh
+      discardPile: [],
+      replenishHands: false,
+    });
   }
 
-  async function startNewRound(czarUserId: string | null, roundNumber: number, currentPlayers?: GamePlayer[]) {
-    if (!gameId || !game) return;
-    const activePlayers = currentPlayers ?? players;
-    const blackCard = shuffleArray(BLACK_CARDS)[0];
+  // Single function that handles all round setup atomically:
+  // 1. Reset has_submitted on all players (prevents premature auto-advance)
+  // 2. Replenish hands if needed (using fresh deck from DB)
+  // 3. Insert the new round row
+  async function beginRound({
+    czarUserId,
+    roundNumber,
+    activePlayers,
+    deck,
+    discardPile,
+    replenishHands,
+  }: {
+    czarUserId: string | null;
+    roundNumber: number;
+    activePlayers?: GamePlayer[];
+    deck: WhiteCard[] | null;
+    discardPile: WhiteCard[];
+    replenishHands: boolean;
+  }) {
+    if (!gameId) return;
+    const currentPlayers = activePlayers ?? players;
 
-    for (const p of activePlayers) {
+    // Step 1: Reset all players' submitted state and set czar BEFORE anything else.
+    // This prevents the auto-advance effect from firing during hand replenishment.
+    for (const p of currentPlayers) {
       await supabase.from('game_players').update({
         is_czar: czarUserId !== null && p.user_id === czarUserId,
         has_submitted: false,
       }).eq('id', p.id);
     }
 
+    // Step 2: Replenish hands using fresh deck from DB
+    if (replenishHands) {
+      const { data: freshGame } = await supabase.from('games').select('deck, discard_pile').eq('id', gameId).maybeSingle();
+      let liveDeck = (freshGame?.deck as WhiteCard[]) ?? deck ?? [];
+      let liveDiscard = (freshGame?.discard_pile as WhiteCard[]) ?? discardPile;
+
+      for (const p of currentPlayers) {
+        const currentHand = p.hand as WhiteCard[];
+        const cardsNeeded = 10 - currentHand.length;
+        if (cardsNeeded > 0) {
+          if (liveDeck.length < cardsNeeded) {
+            liveDeck = shuffleArray([...liveDeck, ...liveDiscard]);
+            liveDiscard = [];
+          }
+          const newCards = liveDeck.slice(0, cardsNeeded);
+          liveDeck = liveDeck.slice(cardsNeeded);
+          await supabase.from('game_players').update({
+            hand: [...currentHand, ...newCards],
+          }).eq('id', p.id);
+        }
+      }
+
+      await supabase.from('games').update({ deck: liveDeck, discard_pile: liveDiscard }).eq('id', gameId);
+    }
+
+    // Step 3: Insert the new round row — this triggers realtime on all clients
+    const blackCard = shuffleArray(BLACK_CARDS)[0];
     const timerEnd = new Date(Date.now() + 90 * 1000).toISOString();
     await supabase.from('rounds').insert({
       game_id: gameId,
@@ -212,31 +270,28 @@ export default function GameRoom() {
 
   async function nextRound() {
     if (!game || !gameId) return;
+    setTransitioning(true);
+
     const nextRoundNum = game.current_round + 1;
     const useVotingMode = players.length <= VOTING_MODE_MAX_PLAYERS;
     const rotation = game.czar_rotation as string[];
     const nextCzarIdx = (game.czar_index + 1) % (rotation.length || 1);
     const nextCzar = useVotingMode ? null : (rotation[nextCzarIdx] ?? null);
 
-    let deck = game.deck as WhiteCard[];
-    const discardPile = game.discard_pile as WhiteCard[];
-    for (const p of players) {
-      const cardsNeeded = 10 - (p.hand as WhiteCard[]).length;
-      if (cardsNeeded > 0) {
-        if (deck.length < cardsNeeded) {
-          deck = shuffleArray([...deck, ...discardPile]);
-          await supabase.from('games').update({ discard_pile: [] }).eq('id', gameId);
-        }
-        const newCards = deck.slice(0, cardsNeeded);
-        deck = deck.slice(cardsNeeded);
-        await supabase.from('game_players').update({
-          hand: [...(p.hand as WhiteCard[]), ...newCards],
-        }).eq('id', p.id);
-      }
-    }
+    await supabase.from('games').update({
+      current_round: nextRoundNum,
+      czar_index: nextCzarIdx,
+    }).eq('id', gameId);
 
-    await supabase.from('games').update({ current_round: nextRoundNum, czar_index: nextCzarIdx, deck }).eq('id', gameId);
-    await startNewRound(nextCzar, nextRoundNum);
+    await beginRound({
+      czarUserId: nextCzar,
+      roundNumber: nextRoundNum,
+      deck: game.deck as WhiteCard[],
+      discardPile: game.discard_pile as WhiteCard[],
+      replenishHands: true,
+    });
+
+    setTransitioning(false);
   }
 
   async function leaveGame() {
