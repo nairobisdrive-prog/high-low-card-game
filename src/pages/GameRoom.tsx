@@ -156,18 +156,25 @@ export default function GameRoom() {
 
       for (const p of currentPlayers) {
         const currentHand = p.hand as WhiteCard[];
-        const cardsNeeded = 10 - currentHand.length;
-        if (cardsNeeded > 0) {
-          if (liveDeck.length < cardsNeeded) {
-            liveDeck = shuffleArray([...liveDeck, ...liveDiscard]);
+        let needed = 10 - currentHand.length;
+        if (needed <= 0) continue;
+
+        const newCards: WhiteCard[] = [];
+        while (needed > 0) {
+          if (liveDeck.length === 0) {
+            if (liveDiscard.length === 0) break;
+            liveDeck = shuffleArray(liveDiscard);
             liveDiscard = [];
           }
-          const newCards = liveDeck.slice(0, cardsNeeded);
-          liveDeck = liveDeck.slice(cardsNeeded);
-          await supabase.from('game_players').update({
-            hand: [...currentHand, ...newCards],
-          }).eq('id', p.id);
+          const take = Math.min(needed, liveDeck.length);
+          newCards.push(...liveDeck.slice(0, take));
+          liveDeck = liveDeck.slice(take);
+          needed -= take;
         }
+
+        await supabase.from('game_players').update({
+          hand: [...currentHand, ...newCards],
+        }).eq('id', p.id);
       }
 
       await supabase.from('games').update({ deck: liveDeck, discard_pile: liveDiscard }).eq('id', gameId);
