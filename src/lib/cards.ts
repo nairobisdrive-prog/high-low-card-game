@@ -1,16 +1,20 @@
 export interface BlackCard {
   id: string;
   text: string;
+  text_es?: string;
   pick: number;
+  type?: string;
 }
 
 export interface WhiteCard {
   id: string;
   text: string;
+  text_es?: string;
+  type?: string;
 }
 
 export const BLACK_CARDS: BlackCard[] = [
-  { id: 'b1', text: '_ is the new _.',  pick: 2 },
+  { id: 'b1', text: '_ is the new _.', pick: 2 },
   { id: 'b2', text: "Why can't I sleep at night?", pick: 1 },
   { id: 'b3', text: "I got 99 problems but _ ain't one.", pick: 1 },
   { id: 'b4', text: "What's that smell?", pick: 1 },
@@ -136,7 +140,7 @@ export const WHITE_CARDS: WhiteCard[] = [
   { id: 'w81', text: 'Wiping her butt.' },
   { id: 'w82', text: 'A bleached asshole.' },
   { id: 'w83', text: 'Full-frontal nudity.' },
-  { id: 'w84', text: 'Lance Armstrong\'s missing testicle.' },
+  { id: 'w84', text: "Lance Armstrong's missing testicle." },
   { id: 'w85', text: 'Natural male enhancement.' },
   { id: 'w86', text: 'Tasteful sideboob.' },
   { id: 'w87', text: 'The token minority.' },

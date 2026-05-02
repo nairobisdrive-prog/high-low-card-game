@@ -9,6 +9,18 @@ import { ArrowLeft, Crown, Check, Trophy, Users, Timer, Skull, ThumbsUp } from '
 
 const VOTING_MODE_MAX_PLAYERS = 3;
 
+// Reusable card text renderer — shows English text with optional Spanish subtitle
+function CardText({ card, className = '' }: { card: WhiteCard | BlackCard; className?: string }) {
+  return (
+    <span className={className}>
+      {card.text}
+      {card.text_es && (
+        <span className="block mt-1 opacity-60" style={{ fontSize: '0.8em' }}>({card.text_es})</span>
+      )}
+    </span>
+  );
+}
+
 export default function GameRoom() {
   const { gameId } = useParams<{ gameId: string }>();
   const { user } = useAuth();
@@ -21,8 +33,6 @@ export default function GameRoom() {
   const [selectedCards, setSelectedCards] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
 
-  // Ref-based guard: prevents auto-advance during round transitions.
-  // A ref (not state) so it doesn't cause re-renders or stale closures.
   const advancingRef = useRef(false);
 
   const myPlayer = players.find((p) => p.user_id === user?.id);
@@ -66,20 +76,16 @@ export default function GameRoom() {
     return () => { supabase.removeChannel(channel); };
   }, [gameId, fetchAll]);
 
-  // Auto-advance to judging when all expected players have submitted for THIS round.
-  // Keyed on currentRound.id so stale player state from a previous round can't fire it.
   useEffect(() => {
     if (advancingRef.current) return;
     if (!currentRound || currentRound.status !== 'submitting') return;
     const submitters = isVotingMode ? players : players.filter((p) => !p.is_czar);
     if (submitters.length === 0) return;
-    // All must have has_submitted true AND must have a submission row for this round
     const submittedUserIds = new Set(submissions.map((s) => s.user_id));
     const allDone = submitters.every((p) => p.has_submitted && submittedUserIds.has(p.user_id));
     if (allDone) advanceToJudging();
   }, [players, submissions, currentRound, isVotingMode]);
 
-  // Auto-resolve voting when all players have voted
   useEffect(() => {
     if (!currentRound || currentRound.status !== 'judging' || !isVotingMode) return;
     if (submissions.length === 0) return;
@@ -115,11 +121,6 @@ export default function GameRoom() {
     });
   }
 
-  // Handles all round setup in a safe order:
-  // 1. Reset has_submitted (must happen first to block premature auto-advance)
-  // 2. Replenish hands from fresh DB deck, adding used cards to discard
-  // 3. Pop next black card from black_deck, reshuffle if empty
-  // 4. Insert round row (triggers realtime for all clients)
   async function beginRound({
     czarUserId,
     roundNumber,
@@ -134,8 +135,6 @@ export default function GameRoom() {
     if (!gameId) return;
     const currentPlayers = activePlayers ?? players;
 
-    // Step 1: Reset submitted state on all players FIRST so the auto-advance
-    // effect can't fire on stale has_submitted=true from the previous round.
     for (const p of currentPlayers) {
       await supabase.from('game_players').update({
         is_czar: czarUserId !== null && p.user_id === czarUserId,
@@ -143,20 +142,15 @@ export default function GameRoom() {
       }).eq('id', p.id);
     }
 
-    // Step 2: Replenish hands, using fresh deck from DB, and collect discards
     if (replenishHands) {
       const { data: freshGame } = await supabase
         .from('games').select('deck, discard_pile').eq('id', gameId).maybeSingle();
       let liveDeck = (freshGame?.deck as WhiteCard[]) ?? [];
       let liveDiscard = (freshGame?.discard_pile as WhiteCard[]) ?? [];
 
-      // Collect all cards played this round to add to discard
       const { data: roundSubs } = await supabase
         .from('submissions').select('cards')
-        .in('round_id', [
-          // get the most recent finished round id
-          ...(currentRound?.id ? [currentRound.id] : []),
-        ]);
+        .in('round_id', [...(currentRound?.id ? [currentRound.id] : [])]);
       const playedCards: WhiteCard[] = (roundSubs ?? []).flatMap((s) => s.cards as WhiteCard[]);
       liveDiscard = [...liveDiscard, ...playedCards];
 
@@ -179,18 +173,14 @@ export default function GameRoom() {
       await supabase.from('games').update({ deck: liveDeck, discard_pile: liveDiscard }).eq('id', gameId);
     }
 
-    // Step 3: Pop the next black card from the server-side black_deck
     const { data: freshGame2 } = await supabase
       .from('games').select('black_deck').eq('id', gameId).maybeSingle();
     let blackDeck = (freshGame2?.black_deck as BlackCard[]) ?? [];
-    if (blackDeck.length === 0) {
-      blackDeck = shuffleArray(BLACK_CARDS);
-    }
+    if (blackDeck.length === 0) blackDeck = shuffleArray(BLACK_CARDS);
     const blackCard = blackDeck[0];
     const remainingBlackDeck = blackDeck.slice(1);
     await supabase.from('games').update({ black_deck: remainingBlackDeck }).eq('id', gameId);
 
-    // Step 4: Insert the round — this is the signal all clients watch for
     const timerEnd = new Date(Date.now() + 90 * 1000).toISOString();
     await supabase.from('rounds').insert({
       game_id: gameId,
@@ -218,9 +208,6 @@ export default function GameRoom() {
       cards,
     });
 
-    // Remove played cards from hand but do NOT add to discard yet —
-    // discard is collected at the start of the next round so we can track
-    // all played cards from the round's submission rows.
     const newHand = myPlayer.hand.filter((c) => !selectedCards.includes(c.id));
     await supabase.from('game_players').update({ has_submitted: true, hand: newHand }).eq('id', myPlayer.id);
 
@@ -438,11 +425,17 @@ export default function GameRoom() {
           </div>
         </div>
 
+        {/* Black card */}
         {currentRound && (
           <div className="bg-black border-2 border-gray-700 rounded-xl p-6 mb-6">
             <p className="text-white text-xl md:text-2xl font-bold leading-relaxed">
               {currentRound.black_card.text}
             </p>
+            {currentRound.black_card.text_es && (
+              <p className="text-gray-400 mt-1.5" style={{ fontSize: '0.9rem' }}>
+                ({currentRound.black_card.text_es})
+              </p>
+            )}
             <div className="mt-3 flex items-center gap-2">
               <span className="text-gray-400 text-sm">Pick {currentRound.black_card.pick}</span>
               {currentRound.timer_ends_at && roundStatus === 'submitting' && (
@@ -496,7 +489,9 @@ export default function GameRoom() {
                           {submitter?.display_name ?? 'Unknown'}
                         </p>
                         {(sub.cards as WhiteCard[]).map((card, i) => (
-                          <p key={i} className="text-gray-900 font-medium text-lg">{card.text}</p>
+                          <p key={i} className="text-gray-900 font-medium text-lg leading-snug">
+                            <CardText card={card} />
+                          </p>
                         ))}
                         {votedThis && (
                           <p className="text-blue-500 text-xs mt-2 font-medium flex items-center gap-1">
@@ -529,7 +524,9 @@ export default function GameRoom() {
                       }`}
                     >
                       {(sub.cards as WhiteCard[]).map((card, i) => (
-                        <p key={i} className="text-gray-900 font-medium text-lg">{card.text}</p>
+                        <p key={i} className="text-gray-900 font-medium text-lg leading-snug">
+                          <CardText card={card} />
+                        </p>
                       ))}
                     </button>
                   ))}
@@ -554,9 +551,11 @@ export default function GameRoom() {
               )}
               <div className="mt-3 flex flex-wrap gap-2 justify-center">
                 {winnerSubmissions.map((s) => (
-                  <div key={s.id} className="bg-white rounded-lg p-3 inline-block">
+                  <div key={s.id} className="bg-white rounded-lg p-3 inline-block text-left">
                     {(s.cards as WhiteCard[]).map((card, i) => (
-                      <p key={i} className="text-gray-900 font-bold">{card.text}</p>
+                      <p key={i} className="text-gray-900 font-bold">
+                        <CardText card={card} />
+                      </p>
                     ))}
                   </div>
                 ))}
@@ -568,6 +567,7 @@ export default function GameRoom() {
           </div>
         )}
 
+        {/* Hand */}
         {roundStatus === 'submitting' && !myPlayer?.has_submitted && myPlayer && (
           <div>
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2 mb-4">
@@ -587,7 +587,12 @@ export default function GameRoom() {
                       isSelected ? 'ring-2 ring-red-500 shadow-lg shadow-red-500/20 scale-[1.03]' : 'hover:shadow-md'
                     }`}
                   >
-                    <p className="text-gray-900 font-medium text-sm leading-tight">{card.text}</p>
+                    <p className="text-gray-900 font-medium text-sm leading-tight">
+                      {card.text}
+                      {card.text_es && (
+                        <span className="block mt-1 text-gray-400" style={{ fontSize: '0.75rem' }}>({card.text_es})</span>
+                      )}
+                    </p>
                   </button>
                 );
               })}
