@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
-import { WHITE_CARDS, shuffleArray } from '../lib/cards';
+import { WHITE_CARDS, BLACK_CARDS, shuffleArray } from '../lib/cards';
 import type { Game, GamePlayer } from '../lib/types';
 import { Plus, LogOut, Users, Play, Trash2, Clock, MoreVertical, Skull } from 'lucide-react';
 
@@ -18,13 +18,11 @@ export default function Lobby() {
 
   useEffect(() => {
     fetchGames();
-
     const channel = supabase
       .channel('lobby')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'games' }, () => fetchGames())
       .on('postgres_changes', { event: '*', schema: 'public', table: 'game_players' }, () => fetchGames())
       .subscribe();
-
     return () => { supabase.removeChannel(channel); };
   }, []);
 
@@ -34,19 +32,14 @@ export default function Lobby() {
       .select('*')
       .in('state', ['waiting', 'active'])
       .order('created_at', { ascending: false });
-
     if (!gamesData) { setLoading(false); return; }
 
     const gamesWithPlayers = await Promise.all(
       gamesData.map(async (game) => {
-        const { data: players } = await supabase
-          .from('game_players')
-          .select('*')
-          .eq('game_id', game.id);
+        const { data: players } = await supabase.from('game_players').select('*').eq('game_id', game.id);
         return { ...game, players: players || [] } as Game & { players: GamePlayer[] };
       })
     );
-
     setGames(gamesWithPlayers);
     setLoading(false);
   }
@@ -56,9 +49,11 @@ export default function Lobby() {
     setCreating(true);
 
     const gameNumber = games.length + 1;
-    const deck = shuffleArray(WHITE_CARDS);
-    const hand = deck.slice(0, 10);
-    const remaining = deck.slice(10);
+    // Shuffle both decks fresh for each new game
+    const whiteDeck = shuffleArray(WHITE_CARDS);
+    const blackDeck = shuffleArray(BLACK_CARDS);
+    const hand = whiteDeck.slice(0, 10);
+    const remaining = whiteDeck.slice(10);
 
     const { data: game, error } = await supabase
       .from('games')
@@ -66,6 +61,7 @@ export default function Lobby() {
         name: `Game ${gameNumber}`,
         state: 'waiting',
         deck: remaining,
+        black_deck: blackDeck,
         created_by: user.id,
       })
       .select()
@@ -87,24 +83,14 @@ export default function Lobby() {
 
   async function joinGame(gameId: string) {
     if (!user) return;
-
-    // Check if already in game
     const game = games.find((g) => g.id === gameId);
     if (!game) return;
 
     const alreadyIn = game.players.some((p) => p.user_id === user.id);
-    if (alreadyIn) {
-      navigate(`/game/${gameId}`);
-      return;
-    }
+    if (alreadyIn) { navigate(`/game/${gameId}`); return; }
 
-    // Fetch the freshest deck from DB to avoid dealing duplicate cards
-    const { data: freshGame } = await supabase
-      .from('games')
-      .select('deck')
-      .eq('id', gameId)
-      .maybeSingle();
-
+    // Always fetch the freshest deck to avoid dealing duplicate cards
+    const { data: freshGame } = await supabase.from('games').select('deck').eq('id', gameId).maybeSingle();
     if (!freshGame) return;
 
     const deck = freshGame.deck as typeof WHITE_CARDS;
@@ -112,7 +98,6 @@ export default function Lobby() {
     const remaining = deck.slice(10);
 
     await supabase.from('games').update({ deck: remaining }).eq('id', gameId);
-
     await supabase.from('game_players').insert({
       game_id: gameId,
       user_id: user.id,
@@ -154,11 +139,7 @@ export default function Lobby() {
           </div>
           <div className="flex items-center gap-3">
             <span className="text-gray-400 text-sm hidden sm:block">{displayName}</span>
-            <button
-              onClick={signOut}
-              className="text-gray-500 hover:text-white transition-colors p-2"
-              title="Sign out"
-            >
+            <button onClick={signOut} className="text-gray-500 hover:text-white transition-colors p-2" title="Sign out">
               <LogOut className="w-5 h-5" />
             </button>
           </div>
@@ -185,10 +166,7 @@ export default function Lobby() {
             games.map((game) => {
               const isInGame = game.players.some((p) => p.user_id === user?.id);
               return (
-                <div
-                  key={game.id}
-                  className="bg-gray-900 border border-gray-800 rounded-xl p-4 hover:border-gray-700 transition-colors"
-                >
+                <div key={game.id} className="bg-gray-900 border border-gray-800 rounded-xl p-4 hover:border-gray-700 transition-colors">
                   <div className="flex items-center justify-between">
                     <div className="flex-1">
                       <div className="flex items-center gap-3">
@@ -211,47 +189,28 @@ export default function Lobby() {
                       </div>
                       <div className="flex gap-1 mt-2 flex-wrap">
                         {game.players.map((p) => (
-                          <span key={p.id} className="text-xs bg-gray-800 text-gray-300 px-2 py-0.5 rounded">
-                            {p.display_name}
-                          </span>
+                          <span key={p.id} className="text-xs bg-gray-800 text-gray-300 px-2 py-0.5 rounded">{p.display_name}</span>
                         ))}
                       </div>
                     </div>
-
                     <div className="flex items-center gap-2 ml-4">
                       {isInGame ? (
-                        <button
-                          onClick={() => navigate(`/game/${game.id}`)}
-                          className="bg-green-600 hover:bg-green-700 text-white font-medium px-4 py-2 rounded-lg transition-colors flex items-center gap-1.5"
-                        >
-                          <Play className="w-4 h-4" />
-                          Rejoin
+                        <button onClick={() => navigate(`/game/${game.id}`)} className="bg-green-600 hover:bg-green-700 text-white font-medium px-4 py-2 rounded-lg transition-colors flex items-center gap-1.5">
+                          <Play className="w-4 h-4" /> Rejoin
                         </button>
                       ) : (
-                        <button
-                          onClick={() => joinGame(game.id)}
-                          className="bg-blue-600 hover:bg-blue-700 text-white font-medium px-4 py-2 rounded-lg transition-colors flex items-center gap-1.5"
-                        >
-                          <Users className="w-4 h-4" />
-                          Join
+                        <button onClick={() => joinGame(game.id)} className="bg-blue-600 hover:bg-blue-700 text-white font-medium px-4 py-2 rounded-lg transition-colors flex items-center gap-1.5">
+                          <Users className="w-4 h-4" /> Join
                         </button>
                       )}
-
                       <div className="relative">
-                        <button
-                          onClick={() => setMenuOpen(menuOpen === game.id ? null : game.id)}
-                          className="text-gray-500 hover:text-white p-2 rounded-lg hover:bg-gray-800 transition-colors"
-                        >
+                        <button onClick={() => setMenuOpen(menuOpen === game.id ? null : game.id)} className="text-gray-500 hover:text-white p-2 rounded-lg hover:bg-gray-800 transition-colors">
                           <MoreVertical className="w-4 h-4" />
                         </button>
                         {menuOpen === game.id && (
                           <div className="absolute right-0 top-full mt-1 bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-10 min-w-[140px]">
-                            <button
-                              onClick={() => killGame(game.id)}
-                              className="w-full text-left px-4 py-2.5 text-red-400 hover:bg-gray-700 rounded-lg transition-colors flex items-center gap-2 text-sm"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                              Kill Game
+                            <button onClick={() => killGame(game.id)} className="w-full text-left px-4 py-2.5 text-red-400 hover:bg-gray-700 rounded-lg transition-colors flex items-center gap-2 text-sm">
+                              <Trash2 className="w-4 h-4" /> Kill Game
                             </button>
                           </div>
                         )}

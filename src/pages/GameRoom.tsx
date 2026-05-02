@@ -1,9 +1,9 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
 import { BLACK_CARDS, shuffleArray } from '../lib/cards';
-import type { WhiteCard } from '../lib/cards';
+import type { WhiteCard, BlackCard } from '../lib/cards';
 import type { Game, GamePlayer, Round, Submission } from '../lib/types';
 import { ArrowLeft, Crown, Check, Trophy, Users, Timer, Skull, ThumbsUp } from 'lucide-react';
 
@@ -20,8 +20,10 @@ export default function GameRoom() {
   const [submissions, setSubmissions] = useState<Submission[]>([]);
   const [selectedCards, setSelectedCards] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
-  // Guard against the auto-advance effect firing during round transitions
-  const [transitioning, setTransitioning] = useState(false);
+
+  // Ref-based guard: prevents auto-advance during round transitions.
+  // A ref (not state) so it doesn't cause re-renders or stale closures.
+  const advancingRef = useRef(false);
 
   const myPlayer = players.find((p) => p.user_id === user?.id);
   const isVotingMode = players.length <= VOTING_MODE_MAX_PLAYERS;
@@ -33,7 +35,6 @@ export default function GameRoom() {
 
   const fetchAll = useCallback(async () => {
     if (!gameId) return;
-
     const { data: gameData } = await supabase.from('games').select('*').eq('id', gameId).maybeSingle();
     if (gameData) setGame(gameData as Game);
 
@@ -41,12 +42,8 @@ export default function GameRoom() {
     if (playersData) setPlayers(playersData as GamePlayer[]);
 
     const { data: roundData } = await supabase
-      .from('rounds')
-      .select('*')
-      .eq('game_id', gameId)
-      .order('round_number', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .from('rounds').select('*').eq('game_id', gameId)
+      .order('round_number', { ascending: false }).limit(1).maybeSingle();
     if (roundData) {
       setCurrentRound(roundData as Round);
       const { data: subs } = await supabase.from('submissions').select('*').eq('round_id', roundData.id);
@@ -59,7 +56,6 @@ export default function GameRoom() {
 
   useEffect(() => {
     fetchAll();
-
     const channel = supabase
       .channel(`game-${gameId}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'games', filter: `id=eq.${gameId}` }, () => fetchAll())
@@ -67,18 +63,21 @@ export default function GameRoom() {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'rounds', filter: `game_id=eq.${gameId}` }, () => fetchAll())
       .on('postgres_changes', { event: '*', schema: 'public', table: 'submissions', filter: `game_id=eq.${gameId}` }, () => fetchAll())
       .subscribe();
-
     return () => { supabase.removeChannel(channel); };
   }, [gameId, fetchAll]);
 
-  // Auto-advance to judging when all players have submitted
+  // Auto-advance to judging when all expected players have submitted for THIS round.
+  // Keyed on currentRound.id so stale player state from a previous round can't fire it.
   useEffect(() => {
-    if (transitioning) return;
+    if (advancingRef.current) return;
     if (!currentRound || currentRound.status !== 'submitting') return;
     const submitters = isVotingMode ? players : players.filter((p) => !p.is_czar);
     if (submitters.length === 0) return;
-    if (submitters.every((p) => p.has_submitted)) advanceToJudging();
-  }, [players, currentRound, isVotingMode, transitioning]);
+    // All must have has_submitted true AND must have a submission row for this round
+    const submittedUserIds = new Set(submissions.map((s) => s.user_id));
+    const allDone = submitters.every((p) => p.has_submitted && submittedUserIds.has(p.user_id));
+    if (allDone) advanceToJudging();
+  }, [players, submissions, currentRound, isVotingMode]);
 
   // Auto-resolve voting when all players have voted
   useEffect(() => {
@@ -112,36 +111,31 @@ export default function GameRoom() {
       czarUserId: useVotingMode ? null : rotation[0],
       roundNumber: 1,
       activePlayers: readyPlayers,
-      deck: null, // will fetch fresh
-      discardPile: [],
       replenishHands: false,
     });
   }
 
-  // Single function that handles all round setup atomically:
-  // 1. Reset has_submitted on all players (prevents premature auto-advance)
-  // 2. Replenish hands if needed (using fresh deck from DB)
-  // 3. Insert the new round row
+  // Handles all round setup in a safe order:
+  // 1. Reset has_submitted (must happen first to block premature auto-advance)
+  // 2. Replenish hands from fresh DB deck, adding used cards to discard
+  // 3. Pop next black card from black_deck, reshuffle if empty
+  // 4. Insert round row (triggers realtime for all clients)
   async function beginRound({
     czarUserId,
     roundNumber,
     activePlayers,
-    deck,
-    discardPile,
     replenishHands,
   }: {
     czarUserId: string | null;
     roundNumber: number;
     activePlayers?: GamePlayer[];
-    deck: WhiteCard[] | null;
-    discardPile: WhiteCard[];
     replenishHands: boolean;
   }) {
     if (!gameId) return;
     const currentPlayers = activePlayers ?? players;
 
-    // Step 1: Reset all players' submitted state and set czar BEFORE anything else.
-    // This prevents the auto-advance effect from firing during hand replenishment.
+    // Step 1: Reset submitted state on all players FIRST so the auto-advance
+    // effect can't fire on stale has_submitted=true from the previous round.
     for (const p of currentPlayers) {
       await supabase.from('game_players').update({
         is_czar: czarUserId !== null && p.user_id === czarUserId,
@@ -149,11 +143,22 @@ export default function GameRoom() {
       }).eq('id', p.id);
     }
 
-    // Step 2: Replenish hands using fresh deck from DB
+    // Step 2: Replenish hands, using fresh deck from DB, and collect discards
     if (replenishHands) {
-      const { data: freshGame } = await supabase.from('games').select('deck, discard_pile').eq('id', gameId).maybeSingle();
-      let liveDeck = (freshGame?.deck as WhiteCard[]) ?? deck ?? [];
-      let liveDiscard = (freshGame?.discard_pile as WhiteCard[]) ?? discardPile;
+      const { data: freshGame } = await supabase
+        .from('games').select('deck, discard_pile').eq('id', gameId).maybeSingle();
+      let liveDeck = (freshGame?.deck as WhiteCard[]) ?? [];
+      let liveDiscard = (freshGame?.discard_pile as WhiteCard[]) ?? [];
+
+      // Collect all cards played this round to add to discard
+      const { data: roundSubs } = await supabase
+        .from('submissions').select('cards')
+        .in('round_id', [
+          // get the most recent finished round id
+          ...(currentRound?.id ? [currentRound.id] : []),
+        ]);
+      const playedCards: WhiteCard[] = (roundSubs ?? []).flatMap((s) => s.cards as WhiteCard[]);
+      liveDiscard = [...liveDiscard, ...playedCards];
 
       for (const p of currentPlayers) {
         const currentHand = p.hand as WhiteCard[];
@@ -174,8 +179,18 @@ export default function GameRoom() {
       await supabase.from('games').update({ deck: liveDeck, discard_pile: liveDiscard }).eq('id', gameId);
     }
 
-    // Step 3: Insert the new round row — this triggers realtime on all clients
-    const blackCard = shuffleArray(BLACK_CARDS)[0];
+    // Step 3: Pop the next black card from the server-side black_deck
+    const { data: freshGame2 } = await supabase
+      .from('games').select('black_deck').eq('id', gameId).maybeSingle();
+    let blackDeck = (freshGame2?.black_deck as BlackCard[]) ?? [];
+    if (blackDeck.length === 0) {
+      blackDeck = shuffleArray(BLACK_CARDS);
+    }
+    const blackCard = blackDeck[0];
+    const remainingBlackDeck = blackDeck.slice(1);
+    await supabase.from('games').update({ black_deck: remainingBlackDeck }).eq('id', gameId);
+
+    // Step 4: Insert the round — this is the signal all clients watch for
     const timerEnd = new Date(Date.now() + 90 * 1000).toISOString();
     await supabase.from('rounds').insert({
       game_id: gameId,
@@ -203,6 +218,9 @@ export default function GameRoom() {
       cards,
     });
 
+    // Remove played cards from hand but do NOT add to discard yet —
+    // discard is collected at the start of the next round so we can track
+    // all played cards from the round's submission rows.
     const newHand = myPlayer.hand.filter((c) => !selectedCards.includes(c.id));
     await supabase.from('game_players').update({ has_submitted: true, hand: newHand }).eq('id', myPlayer.id);
 
@@ -236,11 +254,9 @@ export default function GameRoom() {
     if (!user || !currentRound || hasVoted) return;
     const sub = submissions.find((s) => s.id === submissionId);
     if (!sub) return;
-
-    const updatedVoterIds = [...(sub.voter_ids as string[]), user.id];
     await supabase.from('submissions').update({
       votes: sub.votes + 1,
-      voter_ids: updatedVoterIds,
+      voter_ids: [...(sub.voter_ids as string[]), user.id],
     }).eq('id', submissionId);
   }
 
@@ -270,7 +286,7 @@ export default function GameRoom() {
 
   async function nextRound() {
     if (!game || !gameId) return;
-    setTransitioning(true);
+    advancingRef.current = true;
 
     const nextRoundNum = game.current_round + 1;
     const useVotingMode = players.length <= VOTING_MODE_MAX_PLAYERS;
@@ -286,12 +302,10 @@ export default function GameRoom() {
     await beginRound({
       czarUserId: nextCzar,
       roundNumber: nextRoundNum,
-      deck: game.deck as WhiteCard[],
-      discardPile: game.discard_pile as WhiteCard[],
       replenishHands: true,
     });
 
-    setTransitioning(false);
+    advancingRef.current = false;
   }
 
   async function leaveGame() {
@@ -366,9 +380,7 @@ export default function GameRoom() {
                 <div key={p.id} className="flex items-center justify-between bg-gray-800 rounded-lg px-4 py-2.5">
                   <span className="text-white font-medium">{p.display_name}</span>
                   {p.is_ready ? (
-                    <span className="text-green-400 text-sm flex items-center gap-1">
-                      <Check className="w-4 h-4" /> Ready
-                    </span>
+                    <span className="text-green-400 text-sm flex items-center gap-1"><Check className="w-4 h-4" /> Ready</span>
                   ) : (
                     <span className="text-gray-500 text-sm">Not ready</span>
                   )}
@@ -381,20 +393,14 @@ export default function GameRoom() {
             <button
               onClick={toggleReady}
               className={`flex-1 font-bold py-3 rounded-lg transition-colors ${
-                myPlayer?.is_ready
-                  ? 'bg-gray-700 hover:bg-gray-600 text-gray-300'
-                  : 'bg-green-600 hover:bg-green-700 text-white'
+                myPlayer?.is_ready ? 'bg-gray-700 hover:bg-gray-600 text-gray-300' : 'bg-green-600 hover:bg-green-700 text-white'
               }`}
             >
               {myPlayer?.is_ready ? 'Unready' : 'Ready Up'}
             </button>
             {readyCount >= 2 && (
-              <button
-                onClick={startGame}
-                className="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-3 rounded-lg transition-colors flex items-center justify-center gap-2"
-              >
-                <Skull className="w-5 h-5" />
-                Start Game ({readyCount} ready)
+              <button onClick={startGame} className="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-3 rounded-lg transition-colors flex items-center justify-center gap-2">
+                <Skull className="w-5 h-5" /> Start Game ({readyCount} ready)
               </button>
             )}
           </div>
@@ -453,7 +459,7 @@ export default function GameRoom() {
                 <Check className="w-6 h-6 mx-auto mb-1" />
                 Cards submitted! Waiting for others...
                 <div className="text-sm text-green-400/70 mt-1">
-                  {players.filter((p) => p.has_submitted).length}/{players.length} submitted
+                  {submissions.length}/{isVotingMode ? players.length : players.filter((p) => !p.is_czar).length} submitted
                 </div>
               </div>
             ) : (
@@ -482,9 +488,7 @@ export default function GameRoom() {
                         disabled={hasVoted}
                         className={`text-left bg-white rounded-xl p-4 transition-all ${
                           hasVoted
-                            ? votedThis
-                              ? 'ring-2 ring-blue-500 cursor-default'
-                              : 'cursor-default opacity-70'
+                            ? votedThis ? 'ring-2 ring-blue-500 cursor-default' : 'cursor-default opacity-70'
                             : 'hover:scale-[1.02] hover:shadow-lg cursor-pointer'
                         }`}
                       >
@@ -558,10 +562,7 @@ export default function GameRoom() {
                 ))}
               </div>
             </div>
-            <button
-              onClick={nextRound}
-              className="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-3 rounded-lg transition-colors"
-            >
+            <button onClick={nextRound} className="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-3 rounded-lg transition-colors">
               Next Round
             </button>
           </div>
@@ -609,7 +610,6 @@ export default function GameRoom() {
 
 function CountdownTimer({ endsAt }: { endsAt: string }) {
   const [timeLeft, setTimeLeft] = useState('');
-
   useEffect(() => {
     const update = () => {
       const diff = new Date(endsAt).getTime() - Date.now();
@@ -622,7 +622,6 @@ function CountdownTimer({ endsAt }: { endsAt: string }) {
     const interval = setInterval(update, 1000);
     return () => clearInterval(interval);
   }, [endsAt]);
-
   return (
     <span className="text-gray-400 text-sm flex items-center gap-1">
       <Timer className="w-3.5 h-3.5" />

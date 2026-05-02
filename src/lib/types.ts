@@ -9,6 +9,7 @@ export interface Game {
   czar_rotation: string[];
   czar_index: number;
   deck: WhiteCard[];
+  black_deck: BlackCard[];
   discard_pile: WhiteCard[];
   created_by: string;
   created_at: string;
