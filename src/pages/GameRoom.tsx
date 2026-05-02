@@ -32,11 +32,12 @@ export default function GameRoom() {
   const [submissions, setSubmissions] = useState<Submission[]>([]);
   const [selectedCards, setSelectedCards] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  const [canSummonRando, setCanSummonRando] = useState(false);
 
   const advancingRef = useRef(false);
 
   const myPlayer = players.find((p) => p.user_id === user?.id);
-  const isVotingMode = players.length <= VOTING_MODE_MAX_PLAYERS;
+  const isVotingMode = (game?.democratic_mode ?? false) || players.length <= VOTING_MODE_MAX_PLAYERS;
   const isCzar = !isVotingMode && (myPlayer?.is_czar ?? false);
   const myVotedSubmissionId = submissions.find(
     (s) => (s.voter_ids as string[]).includes(user?.id ?? '')
@@ -77,6 +78,28 @@ export default function GameRoom() {
   }, [gameId, fetchAll]);
 
   useEffect(() => {
+    if (!user || !game) return;
+    if (game.rando_enabled) { setCanSummonRando(false); return; }
+    (async () => {
+      const { data: history } = await supabase
+        .from('game_players')
+        .select('game_id, activated_rando, joined_at')
+        .eq('user_id', user.id)
+        .order('joined_at', { ascending: false });
+      if (!history) return;
+      const lastIdx = history.findIndex((h) => h.activated_rando);
+      setCanSummonRando(lastIdx === -1 || lastIdx >= 3);
+    })();
+  }, [user, game]);
+
+  async function summonRando() {
+    if (!gameId || !myPlayer || !canSummonRando) return;
+    await supabase.from('games').update({ rando_enabled: true }).eq('id', gameId);
+    await supabase.from('game_players').update({ activated_rando: true }).eq('id', myPlayer.id);
+    setCanSummonRando(false);
+  }
+
+  useEffect(() => {
     if (advancingRef.current) return;
     if (!currentRound || currentRound.status !== 'submitting') return;
     const submitters = isVotingMode ? players : players.filter((p) => !p.is_czar);
@@ -85,6 +108,27 @@ export default function GameRoom() {
     const allDone = submitters.every((p) => p.has_submitted && submittedUserIds.has(p.user_id));
     if (allDone) advanceToJudging();
   }, [players, submissions, currentRound, isVotingMode]);
+
+  // Server-truth timer cutoff: host's tab force-advances when timer expires
+  useEffect(() => {
+    if (!game || !currentRound || currentRound.status !== 'submitting') return;
+    if (!currentRound.timer_ends_at) return;
+    if (user?.id !== game.created_by) return;
+    const msLeft = new Date(currentRound.timer_ends_at).getTime() - Date.now();
+    const t = setTimeout(async () => {
+      const { data: latest } = await supabase
+        .from('rounds').select('status').eq('id', currentRound.id).maybeSingle();
+      if (!latest || latest.status !== 'submitting') return;
+      const { data: subs } = await supabase
+        .from('submissions').select('id').eq('round_id', currentRound.id);
+      if (!subs || subs.length === 0) {
+        await supabase.from('rounds').update({ status: 'finished' }).eq('id', currentRound.id);
+      } else {
+        await supabase.from('rounds').update({ status: 'judging' }).eq('id', currentRound.id);
+      }
+    }, Math.max(0, msLeft));
+    return () => clearTimeout(t);
+  }, [currentRound, game, user]);
 
   useEffect(() => {
     if (!currentRound || currentRound.status !== 'judging' || !isVotingMode) return;
@@ -181,22 +225,90 @@ export default function GameRoom() {
     }
 
     const { data: freshGame2 } = await supabase
-      .from('games').select('black_deck').eq('id', gameId).maybeSingle();
+      .from('games').select('black_deck, deck, discard_pile, ghost_card_enabled, rando_enabled, speed_round, created_by').eq('id', gameId).maybeSingle();
     let blackDeck = (freshGame2?.black_deck as BlackCard[]) ?? [];
     if (blackDeck.length === 0) blackDeck = shuffleArray(BLACK_CARDS);
     const blackCard = blackDeck[0];
     const remainingBlackDeck = blackDeck.slice(1);
     await supabase.from('games').update({ black_deck: remainingBlackDeck }).eq('id', gameId);
 
-    const timerEnd = new Date(Date.now() + 90 * 1000).toISOString();
-    await supabase.from('rounds').insert({
+    const timerSeconds = freshGame2?.speed_round ? 90 : 120;
+    const timerEnd = new Date(Date.now() + timerSeconds * 1000).toISOString();
+    const { data: insertedRound } = await supabase.from('rounds').insert({
       game_id: gameId,
       round_number: roundNumber,
       black_card: blackCard,
       status: 'submitting',
       czar_id: czarUserId,
       timer_ends_at: timerEnd,
-    });
+    }).select().single();
+
+    // Ghost card: ~15% chance one random non-czar player gets an auto-played card
+    const ghostEnabled = freshGame2?.ghost_card_enabled ?? false;
+    if (ghostEnabled && insertedRound && Math.random() < 0.15) {
+      const eligible = currentPlayers.filter((p) => p.user_id !== czarUserId);
+      if (eligible.length > 0) {
+        let ghostDeck = (freshGame2?.deck as WhiteCard[]) ?? [];
+        let ghostDiscard = (freshGame2?.discard_pile as WhiteCard[]) ?? [];
+        const ghostCards: WhiteCard[] = [];
+        let need = blackCard.pick;
+        while (need > 0) {
+          if (ghostDeck.length === 0) {
+            if (ghostDiscard.length === 0) break;
+            ghostDeck = shuffleArray(ghostDiscard);
+            ghostDiscard = [];
+          }
+          ghostCards.push(ghostDeck[0]);
+          ghostDeck = ghostDeck.slice(1);
+          need -= 1;
+        }
+        if (ghostCards.length === blackCard.pick) {
+          const ghostPlayer = eligible[Math.floor(Math.random() * eligible.length)];
+          await supabase.from('submissions').insert({
+            round_id: insertedRound.id,
+            game_id: gameId,
+            player_id: ghostPlayer.id,
+            user_id: ghostPlayer.user_id,
+            cards: ghostCards,
+            is_ghost: true,
+          });
+          await supabase.from('game_players').update({ has_submitted: true }).eq('id', ghostPlayer.id);
+          await supabase.from('games').update({ deck: ghostDeck, discard_pile: ghostDiscard }).eq('id', gameId);
+        }
+      }
+    }
+
+    // Rando Cardrissian: every round inserts an extra fake submission
+    const randoEnabled = freshGame2?.rando_enabled ?? false;
+    if (randoEnabled && insertedRound) {
+      const { data: latestGame } = await supabase
+        .from('games').select('deck, discard_pile').eq('id', gameId).maybeSingle();
+      let rDeck = (latestGame?.deck as WhiteCard[]) ?? [];
+      let rDiscard = (latestGame?.discard_pile as WhiteCard[]) ?? [];
+      const rCards: WhiteCard[] = [];
+      let rNeed = blackCard.pick;
+      while (rNeed > 0) {
+        if (rDeck.length === 0) {
+          if (rDiscard.length === 0) break;
+          rDeck = shuffleArray(rDiscard);
+          rDiscard = [];
+        }
+        rCards.push(rDeck[0]);
+        rDeck = rDeck.slice(1);
+        rNeed -= 1;
+      }
+      if (rCards.length === blackCard.pick) {
+        await supabase.from('submissions').insert({
+          round_id: insertedRound.id,
+          game_id: gameId,
+          player_id: null,
+          user_id: freshGame2?.created_by,
+          cards: rCards,
+          is_rando: true,
+        });
+        await supabase.from('games').update({ deck: rDeck, discard_pile: rDiscard }).eq('id', gameId);
+      }
+    }
 
     setSelectedCards([]);
   }
@@ -233,11 +345,18 @@ export default function GameRoom() {
     if (!winnerSub) return;
 
     await supabase.from('submissions').update({ is_winner: true }).eq('id', submissionId);
-    await supabase.from('rounds').update({ status: 'finished', winner_id: winnerSub.user_id }).eq('id', currentRound.id);
+    await supabase.from('rounds').update({ status: 'finished', winner_id: winnerSub.is_rando ? null : winnerSub.user_id }).eq('id', currentRound.id);
 
-    const winnerPlayer = players.find((p) => p.user_id === winnerSub.user_id);
-    if (winnerPlayer) {
-      await supabase.from('game_players').update({ score: winnerPlayer.score + 1 }).eq('id', winnerPlayer.id);
+    if (winnerSub.is_rando) {
+      for (const p of players) {
+        await supabase.from('game_players').update({ score: p.score - 1 }).eq('id', p.id);
+      }
+    } else {
+      const winnerPlayer = players.find((p) => p.user_id === winnerSub.user_id);
+      if (winnerPlayer) {
+        const points = winnerSub.is_ghost ? 3 : 1;
+        await supabase.from('game_players').update({ score: winnerPlayer.score + points }).eq('id', winnerPlayer.id);
+      }
     }
     if (game.current_round >= game.max_rounds) {
       await supabase.from('games').update({ state: 'finished' }).eq('id', gameId);
@@ -262,15 +381,22 @@ export default function GameRoom() {
 
     for (const winnerSub of winners) {
       await supabase.from('submissions').update({ is_winner: true }).eq('id', winnerSub.id);
-      const winnerPlayer = players.find((p) => p.user_id === winnerSub.user_id);
-      if (winnerPlayer) {
-        await supabase.from('game_players').update({ score: winnerPlayer.score + pointEach }).eq('id', winnerPlayer.id);
+      if (winnerSub.is_rando) {
+        for (const p of players) {
+          await supabase.from('game_players').update({ score: p.score - pointEach }).eq('id', p.id);
+        }
+      } else {
+        const winnerPlayer = players.find((p) => p.user_id === winnerSub.user_id);
+        if (winnerPlayer) {
+          const bonus = winnerSub.is_ghost ? 3 : 1;
+          await supabase.from('game_players').update({ score: winnerPlayer.score + bonus * pointEach }).eq('id', winnerPlayer.id);
+        }
       }
     }
 
     await supabase.from('rounds').update({
       status: 'finished',
-      winner_id: winners[0].user_id,
+      winner_id: winners[0].is_rando ? null : winners[0].user_id,
     }).eq('id', currentRound.id);
 
     if (game.current_round >= game.max_rounds) {
@@ -280,13 +406,28 @@ export default function GameRoom() {
 
   async function nextRound() {
     if (!game || !gameId) return;
+    if (advancingRef.current) return;
     advancingRef.current = true;
 
     const nextRoundNum = game.current_round + 1;
-    const useVotingMode = players.length <= VOTING_MODE_MAX_PLAYERS;
+    const { data: latest } = await supabase
+      .from('rounds').select('round_number').eq('game_id', gameId)
+      .order('round_number', { ascending: false }).limit(1).maybeSingle();
+    if (latest && latest.round_number >= nextRoundNum) {
+      advancingRef.current = false;
+      return;
+    }
+
+    const useVotingMode = (game.democratic_mode ?? false) || players.length <= VOTING_MODE_MAX_PLAYERS;
     const rotation = game.czar_rotation as string[];
-    const nextCzarIdx = (game.czar_index + 1) % (rotation.length || 1);
-    const nextCzar = useVotingMode ? null : (rotation[nextCzarIdx] ?? null);
+    let nextCzarIdx = (game.czar_index + 1) % (rotation.length || 1);
+    let nextCzar = useVotingMode ? null : (rotation[nextCzarIdx] ?? null);
+
+    if (!useVotingMode && game.meritocracy_enabled && currentRound?.winner_id) {
+      nextCzar = currentRound.winner_id;
+      const winnerIdx = rotation.indexOf(currentRound.winner_id);
+      if (winnerIdx !== -1) nextCzarIdx = winnerIdx;
+    }
 
     await supabase.from('games').update({
       current_round: nextRoundNum,
@@ -304,6 +445,42 @@ export default function GameRoom() {
 
   async function leaveGame() {
     if (!myPlayer || !gameId) return;
+    if (game?.state === 'active' && !confirm('Leave the game? Your cards go back into the deck and you forfeit your score.')) return;
+
+    if (game?.state === 'active') {
+      const { data: freshGame } = await supabase
+        .from('games').select('discard_pile, czar_rotation, czar_index').eq('id', gameId).maybeSingle();
+      if (freshGame) {
+        const discard = [...((freshGame.discard_pile as WhiteCard[]) ?? []), ...(myPlayer.hand as WhiteCard[])];
+        const rotation = (freshGame.czar_rotation as string[]) ?? [];
+        const leavingIdx = rotation.indexOf(myPlayer.user_id);
+        const newRotation = rotation.filter((id) => id !== myPlayer.user_id);
+        let newCzarIdx = freshGame.czar_index ?? 0;
+        if (leavingIdx !== -1 && leavingIdx < newCzarIdx) newCzarIdx -= 1;
+        if (newRotation.length > 0) newCzarIdx = newCzarIdx % newRotation.length;
+        await supabase.from('games').update({
+          discard_pile: discard,
+          czar_rotation: newRotation,
+          czar_index: newCzarIdx,
+        }).eq('id', gameId);
+      }
+    }
+
+    if (
+      game?.state === 'active' &&
+      !isVotingMode &&
+      currentRound &&
+      currentRound.status !== 'finished' &&
+      currentRound.czar_id === myPlayer.user_id
+    ) {
+      const candidates = players.filter((p) => p.user_id !== myPlayer.user_id);
+      if (candidates.length > 0) {
+        const newCzar = candidates[Math.floor(Math.random() * candidates.length)];
+        await supabase.from('rounds').update({ czar_id: newCzar.user_id }).eq('id', currentRound.id);
+        await supabase.from('game_players').update({ is_czar: true }).eq('id', newCzar.id);
+      }
+    }
+
     await supabase.from('game_players').delete().eq('id', myPlayer.id);
     navigate('/');
   }
@@ -383,6 +560,35 @@ export default function GameRoom() {
             </div>
           </div>
 
+          {user?.id === game.created_by && (
+            <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 mb-4 space-y-3">
+              <p className="text-white font-bold text-sm">Game Modes</p>
+              {([
+                { key: 'ghost_card_enabled', label: '👻 Ghost Card', desc: '~15% chance per round a random player gets an auto-played card. If it wins: +3 points.' },
+                { key: 'democratic_mode', label: '🗳️ Democratic Mode', desc: 'No Card Czar — everyone votes anonymously. Most votes wins.' },
+                { key: 'rando_enabled', label: '🎲 Rando Cardrissian', desc: 'Every round adds an auto-played fake submission. If Rando wins, everyone loses a point.' },
+                { key: 'hot_take_enabled', label: '🔥 Hot Take', desc: 'After winner is picked, all submissions are revealed with author names.' },
+                { key: 'meritocracy_enabled', label: '👑 Meritocracy', desc: 'Last round\'s winner becomes the next Card Czar (czar mode only).' },
+                { key: 'speed_round', label: '⚡ Speed Round', desc: '90-second timer instead of 2 minutes.' },
+              ] as const).map(({ key, label, desc }) => (
+                <label key={key} className="flex items-start justify-between cursor-pointer">
+                  <div className="pr-3">
+                    <div className="text-white font-medium text-sm">{label}</div>
+                    <div className="text-gray-500 text-xs mt-0.5">{desc}</div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={(game[key] as boolean) ?? false}
+                    onChange={async (e) => {
+                      await supabase.from('games').update({ [key]: e.target.checked }).eq('id', gameId);
+                    }}
+                    className="w-5 h-5 accent-red-500 mt-0.5 flex-shrink-0"
+                  />
+                </label>
+              ))}
+            </div>
+          )}
+
           <div className="flex gap-3">
             <button
               onClick={toggleReady}
@@ -429,6 +635,23 @@ export default function GameRoom() {
                 {p.display_name}: {p.score}
               </span>
             ))}
+            {canSummonRando && (
+              <button
+                onClick={summonRando}
+                className="text-xs text-gray-700 hover:text-gray-500 px-1.5 py-1 rounded transition-colors"
+                title="✦"
+                aria-label="✦"
+              >
+                ✦
+              </button>
+            )}
+            <button
+              onClick={leaveGame}
+              className="text-xs text-gray-500 hover:text-red-400 px-2 py-1 rounded hover:bg-gray-800 transition-colors"
+              title="Leave game"
+            >
+              Leave
+            </button>
           </div>
         </div>
 
@@ -455,13 +678,26 @@ export default function GameRoom() {
         {roundStatus === 'submitting' && (
           <div className="mb-4">
             {myPlayer?.has_submitted ? (
-              <div className="bg-green-500/10 border border-green-500/30 rounded-lg p-4 text-green-300 text-center">
-                <Check className="w-6 h-6 mx-auto mb-1" />
-                Cards submitted! Waiting for others...
-                <div className="text-sm text-green-400/70 mt-1">
-                  {submissions.length}/{isVotingMode ? players.length : players.filter((p) => !p.is_czar).length} submitted
+              submissions.find((s) => s.user_id === user?.id)?.is_ghost ? (
+                <div className="bg-purple-500/10 border border-purple-500/30 rounded-lg p-4 text-purple-200 text-center">
+                  <div className="text-2xl mb-1">👻</div>
+                  <div className="font-bold">The Ghost picked for you!</div>
+                  <div className="text-sm text-purple-300/70 mt-1">
+                    Your card is hidden until the reveal. If it wins, you score <span className="font-bold">+3</span>.
+                  </div>
+                  <div className="text-xs text-purple-300/60 mt-2">
+                    {submissions.length}/{isVotingMode ? players.length : players.filter((p) => !p.is_czar).length} submitted
+                  </div>
                 </div>
-              </div>
+              ) : (
+                <div className="bg-green-500/10 border border-green-500/30 rounded-lg p-4 text-green-300 text-center">
+                  <Check className="w-6 h-6 mx-auto mb-1" />
+                  Cards submitted! Waiting for others...
+                  <div className="text-sm text-green-400/70 mt-1">
+                    {submissions.length}/{isVotingMode ? players.length : players.filter((p) => !p.is_czar).length} submitted
+                  </div>
+                </div>
+              )
             ) : (
               <p className="text-gray-400 text-sm mb-2">
                 Select {currentRound?.black_card.pick} card{currentRound?.black_card.pick !== 1 ? 's' : ''} from your hand:
@@ -493,7 +729,7 @@ export default function GameRoom() {
                         }`}
                       >
                         <p className="text-xs font-bold text-gray-400 mb-1.5 uppercase tracking-wide">
-                          {submitter?.display_name ?? 'Unknown'}
+                          {sub.is_rando ? '🎲 Rando Cardrissian' : (game.hot_take_enabled ? (submitter?.display_name ?? 'Unknown') : 'Anonymous')}
                         </p>
                         {(sub.cards as WhiteCard[]).map((card, i) => (
                           <p key={i} className="text-gray-900 font-medium text-lg leading-snug">
@@ -549,11 +785,16 @@ export default function GameRoom() {
               <Trophy className="w-8 h-8 text-yellow-400 mx-auto mb-2" />
               {isTie ? (
                 <p className="text-yellow-300 font-bold text-lg">
-                  Tie! {winnerSubmissions.map((s) => players.find((p) => p.user_id === s.user_id)?.display_name).join(' & ')} each get 0.5 pts
+                  Tie! {winnerSubmissions.map((s) => s.is_rando ? '🎲 Rando' : players.find((p) => p.user_id === s.user_id)?.display_name).join(' & ')} each get 0.5 pts
+                </p>
+              ) : winnerSubmissions[0]?.is_rando ? (
+                <p className="text-red-300 font-bold text-lg">
+                  🎲 Rando Cardrissian wins! Everyone loses a point.
                 </p>
               ) : (
                 <p className="text-yellow-300 font-bold text-lg">
                   {players.find((p) => p.user_id === winnerSubmissions[0]?.user_id)?.display_name} wins this round!
+                  {winnerSubmissions[0]?.is_ghost && <span className="ml-2 text-purple-300">👻 +3 ghost bonus!</span>}
                 </p>
               )}
               <div className="mt-3 flex flex-wrap gap-2 justify-center">
@@ -568,9 +809,34 @@ export default function GameRoom() {
                 ))}
               </div>
             </div>
-            <button onClick={nextRound} className="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-3 rounded-lg transition-colors">
-              Next Round
-            </button>
+            {game.hot_take_enabled && submissions.length > 0 && (
+              <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 mb-4">
+                <p className="text-orange-300 font-bold text-sm mb-3 flex items-center gap-1.5">🔥 Hot Take Reveal</p>
+                <div className="space-y-2">
+                  {submissions.map((sub) => {
+                    const submitter = players.find((p) => p.user_id === sub.user_id);
+                    const author = sub.is_rando ? '🎲 Rando Cardrissian' : sub.is_ghost ? `👻 ${submitter?.display_name ?? '?'} (Ghost)` : (submitter?.display_name ?? 'Unknown');
+                    return (
+                      <div key={sub.id} className={`bg-white rounded-lg p-3 ${sub.is_winner ? 'ring-2 ring-yellow-400' : ''}`}>
+                        <p className="text-xs font-bold text-gray-500 uppercase tracking-wide mb-1">{author}{sub.is_winner && ' — winner'}</p>
+                        {(sub.cards as WhiteCard[]).map((card, i) => (
+                          <p key={i} className="text-gray-900 font-medium">
+                            <CardText card={card} />
+                          </p>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            {user?.id === game.created_by ? (
+              <button onClick={nextRound} className="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-3 rounded-lg transition-colors">
+                Next Round
+              </button>
+            ) : (
+              <p className="text-gray-500 text-sm text-center py-3">Waiting for host to start the next round…</p>
+            )}
           </div>
         )}
 
