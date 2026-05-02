@@ -57,23 +57,21 @@ export default function Lobby() {
 
     const gameNumber = games.length + 1;
     const deck = shuffleArray(WHITE_CARDS);
+    const hand = deck.slice(0, 10);
+    const remaining = deck.slice(10);
 
     const { data: game, error } = await supabase
       .from('games')
       .insert({
         name: `Game ${gameNumber}`,
         state: 'waiting',
-        deck,
+        deck: remaining,
         created_by: user.id,
       })
       .select()
       .single();
 
     if (error || !game) { setCreating(false); return; }
-
-    const { hand, remaining } = dealFromDeck(deck, 10);
-
-    await supabase.from('games').update({ deck: remaining }).eq('id', game.id);
 
     await supabase.from('game_players').insert({
       game_id: game.id,
@@ -90,6 +88,7 @@ export default function Lobby() {
   async function joinGame(gameId: string) {
     if (!user) return;
 
+    // Check if already in game
     const game = games.find((g) => g.id === gameId);
     if (!game) return;
 
@@ -99,8 +98,18 @@ export default function Lobby() {
       return;
     }
 
-    const deck = game.deck as unknown as typeof WHITE_CARDS;
-    const { hand, remaining } = dealFromDeck(deck, 10);
+    // Fetch the freshest deck from DB to avoid dealing duplicate cards
+    const { data: freshGame } = await supabase
+      .from('games')
+      .select('deck')
+      .eq('id', gameId)
+      .maybeSingle();
+
+    if (!freshGame) return;
+
+    const deck = freshGame.deck as typeof WHITE_CARDS;
+    const hand = deck.slice(0, 10);
+    const remaining = deck.slice(10);
 
     await supabase.from('games').update({ deck: remaining }).eq('id', gameId);
 
@@ -117,12 +126,6 @@ export default function Lobby() {
   async function killGame(gameId: string) {
     await supabase.from('games').delete().eq('id', gameId);
     setMenuOpen(null);
-  }
-
-  function dealFromDeck(deck: typeof WHITE_CARDS, count: number) {
-    const hand = deck.slice(0, count);
-    const remaining = deck.slice(count);
-    return { hand, remaining };
   }
 
   function getStateLabel(state: string) {
@@ -144,7 +147,6 @@ export default function Lobby() {
   return (
     <div className="min-h-screen bg-gray-950 p-4 md:p-8">
       <div className="max-w-3xl mx-auto">
-        {/* Header */}
         <div className="flex items-center justify-between mb-8">
           <div className="flex items-center gap-3">
             <Skull className="w-8 h-8 text-red-500" />
@@ -162,7 +164,6 @@ export default function Lobby() {
           </div>
         </div>
 
-        {/* Create Game */}
         <button
           onClick={createGame}
           disabled={creating}
@@ -172,7 +173,6 @@ export default function Lobby() {
           {creating ? 'Creating...' : 'Start New Game'}
         </button>
 
-        {/* Game List */}
         <div className="space-y-3">
           {loading ? (
             <div className="text-center py-12 text-gray-500">Loading games...</div>
@@ -237,7 +237,6 @@ export default function Lobby() {
                         </button>
                       )}
 
-                      {/* Options menu */}
                       <div className="relative">
                         <button
                           onClick={() => setMenuOpen(menuOpen === game.id ? null : game.id)}

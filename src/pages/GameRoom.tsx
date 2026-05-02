@@ -5,7 +5,10 @@ import { useAuth } from '../context/AuthContext';
 import { BLACK_CARDS, shuffleArray } from '../lib/cards';
 import type { WhiteCard } from '../lib/cards';
 import type { Game, GamePlayer, Round, Submission } from '../lib/types';
-import { ArrowLeft, Crown, Check, Trophy, Users, Timer, Skull } from 'lucide-react';
+import { ArrowLeft, Crown, Check, Trophy, Users, Timer, Skull, ThumbsUp } from 'lucide-react';
+
+// Small game mode: voting instead of czar when player count <= this threshold
+const VOTING_MODE_MAX_PLAYERS = 3;
 
 export default function GameRoom() {
   const { gameId } = useParams<{ gameId: string }>();
@@ -18,10 +21,15 @@ export default function GameRoom() {
   const [submissions, setSubmissions] = useState<Submission[]>([]);
   const [selectedCards, setSelectedCards] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
-  const [showResults, setShowResults] = useState(false);
 
   const myPlayer = players.find((p) => p.user_id === user?.id);
-  const isCzar = myPlayer?.is_czar ?? false;
+  const isVotingMode = players.length <= VOTING_MODE_MAX_PLAYERS;
+  // In voting mode nobody is czar; in czar mode only the czar judges
+  const isCzar = !isVotingMode && (myPlayer?.is_czar ?? false);
+  const myVotedSubmissionId = submissions.find(
+    (s) => (s.voter_ids as string[]).includes(user?.id ?? '')
+  )?.id ?? null;
+  const hasVoted = myVotedSubmissionId !== null;
 
   const fetchAll = useCallback(async () => {
     if (!gameId) return;
@@ -63,15 +71,26 @@ export default function GameRoom() {
     return () => { supabase.removeChannel(channel); };
   }, [gameId, fetchAll]);
 
+  // Auto-advance to judging when all non-czar players have submitted
   useEffect(() => {
     if (!currentRound || currentRound.status !== 'submitting') return;
-    const activePlayers = players.filter((p) => !p.is_czar);
-    if (activePlayers.length === 0) return;
-    const allSubmitted = activePlayers.every((p) => p.has_submitted);
-    if (allSubmitted && activePlayers.length > 0) {
+    const submitters = isVotingMode ? players : players.filter((p) => !p.is_czar);
+    if (submitters.length === 0) return;
+    if (submitters.every((p) => p.has_submitted)) {
       advanceToJudging();
     }
-  }, [players, currentRound]);
+  }, [players, currentRound, isVotingMode]);
+
+  // Auto-resolve voting when all eligible voters have voted
+  useEffect(() => {
+    if (!currentRound || currentRound.status !== 'judging' || !isVotingMode) return;
+    if (submissions.length === 0) return;
+    const totalVotes = submissions.reduce((sum, s) => sum + (s.voter_ids as string[]).length, 0);
+    // Each player votes once; all players submitted so all are eligible voters
+    if (totalVotes >= players.length) {
+      resolveVoting();
+    }
+  }, [submissions, currentRound, isVotingMode, players.length]);
 
   async function toggleReady() {
     if (!myPlayer) return;
@@ -83,7 +102,8 @@ export default function GameRoom() {
     const readyPlayers = players.filter((p) => p.is_ready);
     if (readyPlayers.length < 2) return;
 
-    const rotation = shuffleArray(readyPlayers.map((p) => p.user_id));
+    const useVotingMode = readyPlayers.length <= VOTING_MODE_MAX_PLAYERS;
+    const rotation = useVotingMode ? [] : shuffleArray(readyPlayers.map((p) => p.user_id));
 
     await supabase.from('games').update({
       state: 'active',
@@ -92,17 +112,18 @@ export default function GameRoom() {
       czar_index: 0,
     }).eq('id', gameId);
 
-    await startNewRound(rotation[0], 1);
+    await startNewRound(useVotingMode ? null : rotation[0], 1, readyPlayers);
   }
 
-  async function startNewRound(czarUserId: string, roundNumber: number) {
+  async function startNewRound(czarUserId: string | null, roundNumber: number, currentPlayers?: GamePlayer[]) {
     if (!gameId || !game) return;
+    const activePlayers = currentPlayers ?? players;
 
     const blackCard = shuffleArray(BLACK_CARDS)[0];
 
-    for (const p of players) {
+    for (const p of activePlayers) {
       await supabase.from('game_players').update({
-        is_czar: p.user_id === czarUserId,
+        is_czar: czarUserId !== null && p.user_id === czarUserId,
         has_submitted: false,
       }).eq('id', p.id);
     }
@@ -119,7 +140,6 @@ export default function GameRoom() {
     });
 
     setSelectedCards([]);
-    setShowResults(false);
   }
 
   async function submitCards() {
@@ -153,6 +173,7 @@ export default function GameRoom() {
     await supabase.from('rounds').update({ status: 'judging' }).eq('id', currentRound.id);
   }
 
+  // Czar mode: czar picks the winner directly
   async function pickWinner(submissionId: string) {
     if (!currentRound || !gameId || !game) return;
 
@@ -167,7 +188,48 @@ export default function GameRoom() {
       await supabase.from('game_players').update({ score: winnerPlayer.score + 1 }).eq('id', winnerPlayer.id);
     }
 
-    setShowResults(true);
+    if (game.current_round >= game.max_rounds) {
+      await supabase.from('games').update({ state: 'finished' }).eq('id', gameId);
+    }
+  }
+
+  // Voting mode: cast a vote for a submission
+  async function castVote(submissionId: string) {
+    if (!user || !currentRound || hasVoted) return;
+    // Cannot vote for your own submission
+    const sub = submissions.find((s) => s.id === submissionId);
+    if (!sub || sub.user_id === user.id) return;
+
+    const updatedVoterIds = [...(sub.voter_ids as string[]), user.id];
+    await supabase.from('submissions').update({
+      votes: sub.votes + 1,
+      voter_ids: updatedVoterIds,
+    }).eq('id', submissionId);
+  }
+
+  // Voting mode: tally votes and award points (half point for ties)
+  async function resolveVoting() {
+    if (!currentRound || !gameId || !game) return;
+
+    const maxVotes = Math.max(...submissions.map((s) => s.votes));
+    const winners = submissions.filter((s) => s.votes === maxVotes);
+    const pointEach = winners.length > 1 ? 0.5 : 1;
+
+    for (const winnerSub of winners) {
+      await supabase.from('submissions').update({ is_winner: true }).eq('id', winnerSub.id);
+      const winnerPlayer = players.find((p) => p.user_id === winnerSub.user_id);
+      if (winnerPlayer) {
+        await supabase.from('game_players').update({
+          score: winnerPlayer.score + pointEach,
+        }).eq('id', winnerPlayer.id);
+      }
+    }
+
+    const primaryWinner = winners[0];
+    await supabase.from('rounds').update({
+      status: 'finished',
+      winner_id: primaryWinner.user_id,
+    }).eq('id', currentRound.id);
 
     if (game.current_round >= game.max_rounds) {
       await supabase.from('games').update({ state: 'finished' }).eq('id', gameId);
@@ -178,22 +240,27 @@ export default function GameRoom() {
     if (!game || !gameId) return;
 
     const nextRoundNum = game.current_round + 1;
+    const useVotingMode = players.length <= VOTING_MODE_MAX_PLAYERS;
     const rotation = game.czar_rotation as string[];
-    const nextCzarIdx = (game.czar_index + 1) % rotation.length;
-    const nextCzar = rotation[nextCzarIdx];
+    const nextCzarIdx = (game.czar_index + 1) % (rotation.length || 1);
+    const nextCzar = useVotingMode ? null : (rotation[nextCzarIdx] ?? null);
 
+    // Replenish hands from deck
     let deck = game.deck as WhiteCard[];
+    const discardPile = game.discard_pile as WhiteCard[];
+
     for (const p of players) {
       const cardsNeeded = 10 - (p.hand as WhiteCard[]).length;
       if (cardsNeeded > 0) {
         if (deck.length < cardsNeeded) {
-          deck = shuffleArray([...deck, ...(game.discard_pile as WhiteCard[])]);
+          deck = shuffleArray([...deck, ...discardPile]);
           await supabase.from('games').update({ discard_pile: [] }).eq('id', gameId);
         }
         const newCards = deck.slice(0, cardsNeeded);
         deck = deck.slice(cardsNeeded);
-        const newHand = [...(p.hand as WhiteCard[]), ...newCards];
-        await supabase.from('game_players').update({ hand: newHand }).eq('id', p.id);
+        await supabase.from('game_players').update({
+          hand: [...(p.hand as WhiteCard[]), ...newCards],
+        }).eq('id', p.id);
       }
     }
 
@@ -228,7 +295,7 @@ export default function GameRoom() {
           <Trophy className="w-16 h-16 text-yellow-400 mx-auto mb-4" />
           <h1 className="text-3xl font-black text-white mb-2">Game Over!</h1>
           <p className="text-gray-400 mb-8">
-            {sorted[0]?.display_name} wins with {sorted[0]?.score} points!
+            {sorted[0]?.display_name} wins with {sorted[0]?.score} point{sorted[0]?.score !== 1 ? 's' : ''}!
           </p>
           <div className="space-y-2 mb-8">
             {sorted.map((p, i) => (
@@ -260,6 +327,13 @@ export default function GameRoom() {
             </button>
             <h1 className="text-2xl font-black text-white">{game.name}</h1>
           </div>
+
+          {readyCount <= VOTING_MODE_MAX_PLAYERS && readyCount >= 2 && (
+            <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg px-4 py-2.5 text-blue-300 text-sm mb-4">
+              <Users className="w-4 h-4 inline mr-1.5" />
+              Small game mode: everyone votes for the best answer
+            </div>
+          )}
 
           <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-4">
             <h2 className="text-lg font-bold text-white mb-4 flex items-center gap-2">
@@ -317,12 +391,13 @@ export default function GameRoom() {
   }
 
   const roundStatus = currentRound?.status ?? 'submitting';
-  const winnerSubmission = submissions.find((s) => s.is_winner);
-  const winnerPlayer = winnerSubmission ? players.find((p) => p.user_id === winnerSubmission.user_id) : null;
+  const winnerSubmissions = submissions.filter((s) => s.is_winner);
+  const isTie = winnerSubmissions.length > 1;
 
   return (
     <div className="min-h-screen bg-gray-950 p-4 md:p-6">
       <div className="max-w-4xl mx-auto">
+        {/* Header */}
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-3">
             <button onClick={() => navigate('/')} className="text-gray-500 hover:text-white transition-colors">
@@ -332,15 +407,16 @@ export default function GameRoom() {
             <span className="text-gray-500 text-sm">Round {game.current_round}/{game.max_rounds}</span>
           </div>
           <div className="flex items-center gap-2">
-            {players.sort((a, b) => b.score - a.score).slice(0, 3).map((p) => (
+            {[...players].sort((a, b) => b.score - a.score).slice(0, 3).map((p) => (
               <span key={p.id} className="text-xs bg-gray-800 text-gray-300 px-2 py-1 rounded flex items-center gap-1">
-                {p.is_czar && <Crown className="w-3 h-3 text-yellow-400" />}
+                {!isVotingMode && p.is_czar && <Crown className="w-3 h-3 text-yellow-400" />}
                 {p.display_name}: {p.score}
               </span>
             ))}
           </div>
         </div>
 
+        {/* Black card */}
         {currentRound && (
           <div className="bg-black border-2 border-gray-700 rounded-xl p-6 mb-6">
             <p className="text-white text-xl md:text-2xl font-bold leading-relaxed">
@@ -355,22 +431,15 @@ export default function GameRoom() {
           </div>
         )}
 
+        {/* Submitting phase status */}
         {roundStatus === 'submitting' && (
           <div className="mb-4">
-            {isCzar ? (
-              <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-4 text-yellow-300 text-center">
-                <Crown className="w-6 h-6 mx-auto mb-1" />
-                You are the Card Czar. Wait for submissions...
-                <div className="text-sm text-yellow-400/70 mt-1">
-                  {players.filter((p) => !p.is_czar && p.has_submitted).length}/{players.filter((p) => !p.is_czar).length} submitted
-                </div>
-              </div>
-            ) : myPlayer?.has_submitted ? (
+            {myPlayer?.has_submitted ? (
               <div className="bg-green-500/10 border border-green-500/30 rounded-lg p-4 text-green-300 text-center">
                 <Check className="w-6 h-6 mx-auto mb-1" />
                 Cards submitted! Waiting for others...
                 <div className="text-sm text-green-400/70 mt-1">
-                  {players.filter((p) => !p.is_czar && p.has_submitted).length}/{players.filter((p) => !p.is_czar).length} submitted
+                  {players.filter((p) => p.has_submitted).length}/{players.length} submitted
                 </div>
               </div>
             ) : (
@@ -381,44 +450,104 @@ export default function GameRoom() {
           </div>
         )}
 
-        {roundStatus === 'judging' && !showResults && (
+        {/* Judging phase */}
+        {roundStatus === 'judging' && (
           <div className="mb-6">
-            <p className="text-gray-300 font-medium mb-3">
-              {isCzar ? 'Pick the winner:' : 'The Czar is choosing...'}
-            </p>
-            <div className="grid gap-3 md:grid-cols-2">
-              {submissions.map((sub) => (
-                <button
-                  key={sub.id}
-                  onClick={() => isCzar && pickWinner(sub.id)}
-                  disabled={!isCzar}
-                  className={`text-left bg-white rounded-xl p-4 transition-all ${
-                    isCzar ? 'hover:scale-[1.02] hover:shadow-lg cursor-pointer' : 'cursor-default'
-                  }`}
-                >
-                  {(sub.cards as WhiteCard[]).map((card, i) => (
-                    <p key={i} className="text-gray-900 font-medium text-lg">
-                      {card.text}
-                    </p>
+            {isVotingMode ? (
+              <>
+                <p className="text-gray-300 font-medium mb-3">
+                  {hasVoted ? 'Vote cast! Waiting for others...' : 'Vote for your favourite answer (not your own):'}
+                </p>
+                <div className="grid gap-3 md:grid-cols-2">
+                  {submissions.map((sub) => {
+                    const submitter = players.find((p) => p.user_id === sub.user_id);
+                    const isOwn = sub.user_id === user?.id;
+                    const votedThis = myVotedSubmissionId === sub.id;
+                    return (
+                      <button
+                        key={sub.id}
+                        onClick={() => !hasVoted && !isOwn && castVote(sub.id)}
+                        disabled={hasVoted || isOwn}
+                        className={`text-left bg-white rounded-xl p-4 transition-all ${
+                          isOwn
+                            ? 'opacity-50 cursor-default'
+                            : hasVoted
+                            ? votedThis
+                              ? 'ring-2 ring-blue-500 cursor-default'
+                              : 'cursor-default opacity-70'
+                            : 'hover:scale-[1.02] hover:shadow-lg cursor-pointer'
+                        }`}
+                      >
+                        <p className="text-xs font-bold text-gray-400 mb-1.5 uppercase tracking-wide">
+                          {submitter?.display_name ?? 'Unknown'}{isOwn ? ' (you)' : ''}
+                        </p>
+                        {(sub.cards as WhiteCard[]).map((card, i) => (
+                          <p key={i} className="text-gray-900 font-medium text-lg">{card.text}</p>
+                        ))}
+                        {votedThis && (
+                          <p className="text-blue-500 text-xs mt-2 font-medium flex items-center gap-1">
+                            <ThumbsUp className="w-3 h-3" /> Your vote
+                          </p>
+                        )}
+                        {(sub.voter_ids as string[]).length > 0 && (
+                          <p className="text-gray-400 text-xs mt-1">
+                            {(sub.voter_ids as string[]).length} vote{(sub.voter_ids as string[]).length !== 1 ? 's' : ''}
+                          </p>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="text-gray-300 font-medium mb-3">
+                  {isCzar ? 'Pick the winner:' : 'The Czar is choosing...'}
+                </p>
+                <div className="grid gap-3 md:grid-cols-2">
+                  {submissions.map((sub) => (
+                    <button
+                      key={sub.id}
+                      onClick={() => isCzar && pickWinner(sub.id)}
+                      disabled={!isCzar}
+                      className={`text-left bg-white rounded-xl p-4 transition-all ${
+                        isCzar ? 'hover:scale-[1.02] hover:shadow-lg cursor-pointer' : 'cursor-default'
+                      }`}
+                    >
+                      {(sub.cards as WhiteCard[]).map((card, i) => (
+                        <p key={i} className="text-gray-900 font-medium text-lg">{card.text}</p>
+                      ))}
+                    </button>
                   ))}
-                </button>
-              ))}
-            </div>
+                </div>
+              </>
+            )}
           </div>
         )}
 
+        {/* Round results */}
         {roundStatus === 'finished' && (
           <div className="mb-6">
             <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-6 text-center mb-4">
               <Trophy className="w-8 h-8 text-yellow-400 mx-auto mb-2" />
-              <p className="text-yellow-300 font-bold text-lg">{winnerPlayer?.display_name} wins this round!</p>
-              {winnerSubmission && (
-                <div className="mt-2 bg-white rounded-lg p-3 inline-block">
-                  {(winnerSubmission.cards as WhiteCard[]).map((card, i) => (
-                    <p key={i} className="text-gray-900 font-bold">{card.text}</p>
-                  ))}
-                </div>
+              {isTie ? (
+                <p className="text-yellow-300 font-bold text-lg">
+                  Tie! {winnerSubmissions.map((s) => players.find((p) => p.user_id === s.user_id)?.display_name).join(' & ')} each get 0.5 pts
+                </p>
+              ) : (
+                <p className="text-yellow-300 font-bold text-lg">
+                  {players.find((p) => p.user_id === winnerSubmissions[0]?.user_id)?.display_name} wins this round!
+                </p>
               )}
+              <div className="mt-3 flex flex-wrap gap-2 justify-center">
+                {winnerSubmissions.map((s) => (
+                  <div key={s.id} className="bg-white rounded-lg p-3 inline-block">
+                    {(s.cards as WhiteCard[]).map((card, i) => (
+                      <p key={i} className="text-gray-900 font-bold">{card.text}</p>
+                    ))}
+                  </div>
+                ))}
+              </div>
             </div>
             <button
               onClick={nextRound}
@@ -429,7 +558,8 @@ export default function GameRoom() {
           </div>
         )}
 
-        {roundStatus === 'submitting' && !isCzar && !myPlayer?.has_submitted && myPlayer && (
+        {/* Hand - shown during submitting phase for all non-submitted players */}
+        {roundStatus === 'submitting' && !myPlayer?.has_submitted && myPlayer && (
           <div>
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2 mb-4">
               {(myPlayer.hand as WhiteCard[]).map((card) => {
@@ -445,7 +575,7 @@ export default function GameRoom() {
                       }
                     }}
                     className={`bg-white rounded-xl p-3 text-left transition-all hover:scale-[1.03] ${
-                      isSelected ? 'ring-3 ring-red-500 shadow-lg shadow-red-500/20 scale-[1.03]' : 'hover:shadow-md'
+                      isSelected ? 'ring-2 ring-red-500 shadow-lg shadow-red-500/20 scale-[1.03]' : 'hover:shadow-md'
                     }`}
                   >
                     <p className="text-gray-900 font-medium text-sm leading-tight">{card.text}</p>
@@ -476,10 +606,7 @@ function CountdownTimer({ endsAt }: { endsAt: string }) {
   useEffect(() => {
     const update = () => {
       const diff = new Date(endsAt).getTime() - Date.now();
-      if (diff <= 0) {
-        setTimeLeft('0:00');
-        return;
-      }
+      if (diff <= 0) { setTimeLeft('0:00'); return; }
       const mins = Math.floor(diff / 60000);
       const secs = Math.floor((diff % 60000) / 1000);
       setTimeLeft(`${mins}:${secs.toString().padStart(2, '0')}`);

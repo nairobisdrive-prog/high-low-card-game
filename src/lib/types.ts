@@ -47,6 +47,7 @@ export interface Submission {
   user_id: string;
   cards: WhiteCard[];
   votes: number;
+  voter_ids: string[];
   is_winner: boolean;
   created_at: string;
 }
