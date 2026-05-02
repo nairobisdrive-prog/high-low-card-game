@@ -7,7 +7,6 @@ import type { WhiteCard } from '../lib/cards';
 import type { Game, GamePlayer, Round, Submission } from '../lib/types';
 import { ArrowLeft, Crown, Check, Trophy, Users, Timer, Skull, ThumbsUp } from 'lucide-react';
 
-// Small game mode: voting instead of czar when player count <= this threshold
 const VOTING_MODE_MAX_PLAYERS = 3;
 
 export default function GameRoom() {
@@ -24,7 +23,6 @@ export default function GameRoom() {
 
   const myPlayer = players.find((p) => p.user_id === user?.id);
   const isVotingMode = players.length <= VOTING_MODE_MAX_PLAYERS;
-  // In voting mode nobody is czar; in czar mode only the czar judges
   const isCzar = !isVotingMode && (myPlayer?.is_czar ?? false);
   const myVotedSubmissionId = submissions.find(
     (s) => (s.voter_ids as string[]).includes(user?.id ?? '')
@@ -71,25 +69,18 @@ export default function GameRoom() {
     return () => { supabase.removeChannel(channel); };
   }, [gameId, fetchAll]);
 
-  // Auto-advance to judging when all non-czar players have submitted
   useEffect(() => {
     if (!currentRound || currentRound.status !== 'submitting') return;
     const submitters = isVotingMode ? players : players.filter((p) => !p.is_czar);
     if (submitters.length === 0) return;
-    if (submitters.every((p) => p.has_submitted)) {
-      advanceToJudging();
-    }
+    if (submitters.every((p) => p.has_submitted)) advanceToJudging();
   }, [players, currentRound, isVotingMode]);
 
-  // Auto-resolve voting when all eligible voters have voted
   useEffect(() => {
     if (!currentRound || currentRound.status !== 'judging' || !isVotingMode) return;
     if (submissions.length === 0) return;
     const totalVotes = submissions.reduce((sum, s) => sum + (s.voter_ids as string[]).length, 0);
-    // Each player votes once; all players submitted so all are eligible voters
-    if (totalVotes >= players.length) {
-      resolveVoting();
-    }
+    if (totalVotes >= players.length) resolveVoting();
   }, [submissions, currentRound, isVotingMode, players.length]);
 
   async function toggleReady() {
@@ -118,7 +109,6 @@ export default function GameRoom() {
   async function startNewRound(czarUserId: string | null, roundNumber: number, currentPlayers?: GamePlayer[]) {
     if (!gameId || !game) return;
     const activePlayers = currentPlayers ?? players;
-
     const blackCard = shuffleArray(BLACK_CARDS)[0];
 
     for (const p of activePlayers) {
@@ -129,7 +119,6 @@ export default function GameRoom() {
     }
 
     const timerEnd = new Date(Date.now() + 90 * 1000).toISOString();
-
     await supabase.from('rounds').insert({
       game_id: gameId,
       round_number: roundNumber,
@@ -145,11 +134,9 @@ export default function GameRoom() {
   async function submitCards() {
     if (!myPlayer || !currentRound || !gameId || !user) return;
     if (selectedCards.length !== currentRound.black_card.pick) return;
-
     setSubmitting(true);
 
     const cards = selectedCards.map((id) => myPlayer.hand.find((c) => c.id === id)!);
-
     await supabase.from('submissions').insert({
       round_id: currentRound.id,
       game_id: gameId,
@@ -159,10 +146,7 @@ export default function GameRoom() {
     });
 
     const newHand = myPlayer.hand.filter((c) => !selectedCards.includes(c.id));
-    await supabase.from('game_players').update({
-      has_submitted: true,
-      hand: newHand,
-    }).eq('id', myPlayer.id);
+    await supabase.from('game_players').update({ has_submitted: true, hand: newHand }).eq('id', myPlayer.id);
 
     setSelectedCards([]);
     setSubmitting(false);
@@ -173,10 +157,8 @@ export default function GameRoom() {
     await supabase.from('rounds').update({ status: 'judging' }).eq('id', currentRound.id);
   }
 
-  // Czar mode: czar picks the winner directly
   async function pickWinner(submissionId: string) {
     if (!currentRound || !gameId || !game) return;
-
     const winnerSub = submissions.find((s) => s.id === submissionId);
     if (!winnerSub) return;
 
@@ -187,18 +169,15 @@ export default function GameRoom() {
     if (winnerPlayer) {
       await supabase.from('game_players').update({ score: winnerPlayer.score + 1 }).eq('id', winnerPlayer.id);
     }
-
     if (game.current_round >= game.max_rounds) {
       await supabase.from('games').update({ state: 'finished' }).eq('id', gameId);
     }
   }
 
-  // Voting mode: cast a vote for a submission
   async function castVote(submissionId: string) {
     if (!user || !currentRound || hasVoted) return;
-    // Cannot vote for your own submission
     const sub = submissions.find((s) => s.id === submissionId);
-    if (!sub || sub.user_id === user.id) return;
+    if (!sub) return;
 
     const updatedVoterIds = [...(sub.voter_ids as string[]), user.id];
     await supabase.from('submissions').update({
@@ -207,10 +186,8 @@ export default function GameRoom() {
     }).eq('id', submissionId);
   }
 
-  // Voting mode: tally votes and award points (half point for ties)
   async function resolveVoting() {
     if (!currentRound || !gameId || !game) return;
-
     const maxVotes = Math.max(...submissions.map((s) => s.votes));
     const winners = submissions.filter((s) => s.votes === maxVotes);
     const pointEach = winners.length > 1 ? 0.5 : 1;
@@ -219,16 +196,13 @@ export default function GameRoom() {
       await supabase.from('submissions').update({ is_winner: true }).eq('id', winnerSub.id);
       const winnerPlayer = players.find((p) => p.user_id === winnerSub.user_id);
       if (winnerPlayer) {
-        await supabase.from('game_players').update({
-          score: winnerPlayer.score + pointEach,
-        }).eq('id', winnerPlayer.id);
+        await supabase.from('game_players').update({ score: winnerPlayer.score + pointEach }).eq('id', winnerPlayer.id);
       }
     }
 
-    const primaryWinner = winners[0];
     await supabase.from('rounds').update({
       status: 'finished',
-      winner_id: primaryWinner.user_id,
+      winner_id: winners[0].user_id,
     }).eq('id', currentRound.id);
 
     if (game.current_round >= game.max_rounds) {
@@ -238,17 +212,14 @@ export default function GameRoom() {
 
   async function nextRound() {
     if (!game || !gameId) return;
-
     const nextRoundNum = game.current_round + 1;
     const useVotingMode = players.length <= VOTING_MODE_MAX_PLAYERS;
     const rotation = game.czar_rotation as string[];
     const nextCzarIdx = (game.czar_index + 1) % (rotation.length || 1);
     const nextCzar = useVotingMode ? null : (rotation[nextCzarIdx] ?? null);
 
-    // Replenish hands from deck
     let deck = game.deck as WhiteCard[];
     const discardPile = game.discard_pile as WhiteCard[];
-
     for (const p of players) {
       const cardsNeeded = 10 - (p.hand as WhiteCard[]).length;
       if (cardsNeeded > 0) {
@@ -264,12 +235,7 @@ export default function GameRoom() {
       }
     }
 
-    await supabase.from('games').update({
-      current_round: nextRoundNum,
-      czar_index: nextCzarIdx,
-      deck,
-    }).eq('id', gameId);
-
+    await supabase.from('games').update({ current_round: nextRoundNum, czar_index: nextCzarIdx, deck }).eq('id', gameId);
     await startNewRound(nextCzar, nextRoundNum);
   }
 
@@ -367,7 +333,6 @@ export default function GameRoom() {
             >
               {myPlayer?.is_ready ? 'Unready' : 'Ready Up'}
             </button>
-
             {readyCount >= 2 && (
               <button
                 onClick={startGame}
@@ -379,10 +344,7 @@ export default function GameRoom() {
             )}
           </div>
 
-          <button
-            onClick={leaveGame}
-            className="w-full mt-3 text-gray-500 hover:text-red-400 text-sm py-2 transition-colors"
-          >
+          <button onClick={leaveGame} className="w-full mt-3 text-gray-500 hover:text-red-400 text-sm py-2 transition-colors">
             Leave Game
           </button>
         </div>
@@ -397,7 +359,6 @@ export default function GameRoom() {
   return (
     <div className="min-h-screen bg-gray-950 p-4 md:p-6">
       <div className="max-w-4xl mx-auto">
-        {/* Header */}
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-3">
             <button onClick={() => navigate('/')} className="text-gray-500 hover:text-white transition-colors">
@@ -416,7 +377,6 @@ export default function GameRoom() {
           </div>
         </div>
 
-        {/* Black card */}
         {currentRound && (
           <div className="bg-black border-2 border-gray-700 rounded-xl p-6 mb-6">
             <p className="text-white text-xl md:text-2xl font-bold leading-relaxed">
@@ -431,7 +391,6 @@ export default function GameRoom() {
           </div>
         )}
 
-        {/* Submitting phase status */}
         {roundStatus === 'submitting' && (
           <div className="mb-4">
             {myPlayer?.has_submitted ? (
@@ -450,28 +409,24 @@ export default function GameRoom() {
           </div>
         )}
 
-        {/* Judging phase */}
         {roundStatus === 'judging' && (
           <div className="mb-6">
             {isVotingMode ? (
               <>
                 <p className="text-gray-300 font-medium mb-3">
-                  {hasVoted ? 'Vote cast! Waiting for others...' : 'Vote for your favourite answer (not your own):'}
+                  {hasVoted ? 'Vote cast! Waiting for others...' : 'Vote for the best answer:'}
                 </p>
                 <div className="grid gap-3 md:grid-cols-2">
                   {submissions.map((sub) => {
                     const submitter = players.find((p) => p.user_id === sub.user_id);
-                    const isOwn = sub.user_id === user?.id;
                     const votedThis = myVotedSubmissionId === sub.id;
                     return (
                       <button
                         key={sub.id}
-                        onClick={() => !hasVoted && !isOwn && castVote(sub.id)}
-                        disabled={hasVoted || isOwn}
+                        onClick={() => !hasVoted && castVote(sub.id)}
+                        disabled={hasVoted}
                         className={`text-left bg-white rounded-xl p-4 transition-all ${
-                          isOwn
-                            ? 'opacity-50 cursor-default'
-                            : hasVoted
+                          hasVoted
                             ? votedThis
                               ? 'ring-2 ring-blue-500 cursor-default'
                               : 'cursor-default opacity-70'
@@ -479,7 +434,7 @@ export default function GameRoom() {
                         }`}
                       >
                         <p className="text-xs font-bold text-gray-400 mb-1.5 uppercase tracking-wide">
-                          {submitter?.display_name ?? 'Unknown'}{isOwn ? ' (you)' : ''}
+                          {submitter?.display_name ?? 'Unknown'}
                         </p>
                         {(sub.cards as WhiteCard[]).map((card, i) => (
                           <p key={i} className="text-gray-900 font-medium text-lg">{card.text}</p>
@@ -525,7 +480,6 @@ export default function GameRoom() {
           </div>
         )}
 
-        {/* Round results */}
         {roundStatus === 'finished' && (
           <div className="mb-6">
             <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-6 text-center mb-4">
@@ -558,7 +512,6 @@ export default function GameRoom() {
           </div>
         )}
 
-        {/* Hand - shown during submitting phase for all non-submitted players */}
         {roundStatus === 'submitting' && !myPlayer?.has_submitted && myPlayer && (
           <div>
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2 mb-4">
@@ -583,7 +536,6 @@ export default function GameRoom() {
                 );
               })}
             </div>
-
             {selectedCards.length === (currentRound?.black_card.pick ?? 1) && (
               <button
                 onClick={submitCards}
