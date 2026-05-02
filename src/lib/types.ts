@@ -13,6 +13,12 @@ export interface Game {
   discard_pile: WhiteCard[];
   created_by: string;
   created_at: string;
+  ghost_card_enabled: boolean;
+  democratic_mode: boolean;
+  rando_enabled: boolean;
+  hot_take_enabled: boolean;
+  meritocracy_enabled: boolean;
+  speed_round: boolean;
 }
 
 export interface GamePlayer {
@@ -25,6 +31,7 @@ export interface GamePlayer {
   is_czar: boolean;
   has_submitted: boolean;
   is_ready: boolean;
+  activated_rando: boolean;
   joined_at: string;
 }
 
@@ -50,5 +57,7 @@ export interface Submission {
   votes: number;
   voter_ids: string[];
   is_winner: boolean;
+  is_ghost: boolean;
+  is_rando: boolean;
   created_at: string;
 }
