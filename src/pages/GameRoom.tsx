@@ -192,28 +192,59 @@ export default function GameRoom() {
       let liveDeck = (freshGame?.deck as WhiteCard[]) ?? [];
       let liveDiscard = (freshGame?.discard_pile as WhiteCard[]) ?? [];
 
+      const dedupeById = (cards: WhiteCard[], reject: Set<string>) => {
+        const seen = new Set<string>();
+        return cards.filter((c) => {
+          if (reject.has(c.id) || seen.has(c.id)) return false;
+          seen.add(c.id);
+          return true;
+        });
+      };
+
+      const dedupedHands = currentPlayers.map((p) => {
+        const seen = new Set<string>();
+        const hand = (p.hand as WhiteCard[]).filter((c) => {
+          if (seen.has(c.id)) return false;
+          seen.add(c.id);
+          return true;
+        });
+        return { player: p, hand };
+      });
+      const claimedIds = new Set<string>();
+      for (const { hand } of dedupedHands) {
+        const kept: WhiteCard[] = [];
+        for (const c of hand) {
+          if (!claimedIds.has(c.id)) { claimedIds.add(c.id); kept.push(c); }
+        }
+        hand.length = 0;
+        hand.push(...kept);
+      }
+
       const { data: roundSubs } = await supabase
         .from('submissions').select('cards')
         .in('round_id', [...(currentRound?.id ? [currentRound.id] : [])]);
       const playedCards: WhiteCard[] = (roundSubs ?? []).flatMap((s) => s.cards as WhiteCard[]);
-      liveDiscard = [...liveDiscard, ...playedCards];
 
-      for (const p of currentPlayers) {
-        const currentHand = p.hand as WhiteCard[];
+      liveDeck = dedupeById(liveDeck, claimedIds);
+      const deckIds = new Set(liveDeck.map((c) => c.id));
+      liveDiscard = dedupeById([...liveDiscard, ...playedCards], new Set([...claimedIds, ...deckIds]));
+
+      for (const { player: p, hand: currentHand } of dedupedHands) {
         let needed = 10 - currentHand.length;
-        if (needed <= 0) continue;
-
         const newCards: WhiteCard[] = [];
-        while (needed > 0) {
+        let safety = liveDeck.length + liveDiscard.length + 50;
+        while (needed > 0 && safety-- > 0) {
           if (liveDeck.length === 0) {
             if (liveDiscard.length === 0) break;
             liveDeck = shuffleArray(liveDiscard);
             liveDiscard = [];
           }
-          const take = Math.min(needed, liveDeck.length);
-          newCards.push(...liveDeck.slice(0, take));
-          liveDeck = liveDeck.slice(take);
-          needed -= take;
+          const card = liveDeck[0];
+          liveDeck = liveDeck.slice(1);
+          if (claimedIds.has(card.id)) continue; // skip duplicates entirely
+          claimedIds.add(card.id);
+          newCards.push(card);
+          needed -= 1;
         }
 
         await supabase.from('game_players').update({
@@ -567,7 +598,6 @@ export default function GameRoom() {
                 { key: 'ghost_card_enabled', label: '👻 Ghost Card', desc: '~15% chance per round a random player gets an auto-played card. If it wins: +3 points.' },
                 { key: 'democratic_mode', label: '🗳️ Democratic Mode', desc: 'No Card Czar — everyone votes anonymously. Most votes wins.' },
                 { key: 'rando_enabled', label: '🎲 Rando Cardrissian', desc: 'Every round adds an auto-played fake submission. If Rando wins, everyone loses a point.' },
-                { key: 'hot_take_enabled', label: '🔥 Hot Take', desc: 'After winner is picked, all submissions are revealed with author names.' },
                 { key: 'meritocracy_enabled', label: '👑 Meritocracy', desc: 'Last round\'s winner becomes the next Card Czar (czar mode only).' },
                 { key: 'speed_round', label: '⚡ Speed Round', desc: '90-second timer instead of 2 minutes.' },
               ] as const).map(({ key, label, desc }) => (
@@ -729,7 +759,7 @@ export default function GameRoom() {
                         }`}
                       >
                         <p className="text-xs font-bold text-gray-400 mb-1.5 uppercase tracking-wide">
-                          {sub.is_rando ? '🎲 Rando Cardrissian' : (game.hot_take_enabled ? (submitter?.display_name ?? 'Unknown') : 'Anonymous')}
+                          {sub.is_rando ? '🎲 Rando Cardrissian' : (submitter?.display_name ?? 'Unknown')}
                         </p>
                         {(sub.cards as WhiteCard[]).map((card, i) => (
                           <p key={i} className="text-gray-900 font-medium text-lg leading-snug">
@@ -809,9 +839,9 @@ export default function GameRoom() {
                 ))}
               </div>
             </div>
-            {game.hot_take_enabled && submissions.length > 0 && (
+            {submissions.length > 0 && (
               <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 mb-4">
-                <p className="text-orange-300 font-bold text-sm mb-3 flex items-center gap-1.5">🔥 Hot Take Reveal</p>
+                <p className="text-orange-300 font-bold text-sm mb-3 flex items-center gap-1.5">🔥 Round Reveal</p>
                 <div className="space-y-2">
                   {submissions.map((sub) => {
                     const submitter = players.find((p) => p.user_id === sub.user_id);
