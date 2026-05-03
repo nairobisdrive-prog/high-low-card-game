@@ -32,6 +32,7 @@ export interface GamePlayer {
   has_submitted: boolean;
   is_ready: boolean;
   activated_rando: boolean;
+  avatar_emoji: string;
   joined_at: string;
 }
 
