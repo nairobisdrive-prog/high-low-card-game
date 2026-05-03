@@ -15,6 +15,7 @@ export default function Lobby() {
   const [menuOpen, setMenuOpen] = useState<string | null>(null);
 
   const displayName = user?.user_metadata?.display_name || user?.email?.split('@')[0] || 'Anon';
+  const avatarEmoji = user?.user_metadata?.avatar_emoji || '💀';
 
   useEffect(() => {
     fetchGames();
@@ -73,6 +74,7 @@ export default function Lobby() {
       game_id: game.id,
       user_id: user.id,
       display_name: displayName,
+      avatar_emoji: avatarEmoji,
       hand,
       is_ready: true,
     });
@@ -102,6 +104,7 @@ export default function Lobby() {
       game_id: gameId,
       user_id: user.id,
       display_name: displayName,
+      avatar_emoji: avatarEmoji,
       hand,
     });
 
